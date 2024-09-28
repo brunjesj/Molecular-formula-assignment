@@ -19,7 +19,8 @@ sample_list <- lapply(csv_files_samples, fread)
 names(blank_list) <- tools::file_path_sans_ext(basename(csv_files_blanks))
 names(sample_list) <- tools::file_path_sans_ext(basename(csv_files_samples))
 
-#remove outliers of resolution vs mass. From Merder et al, 2020
+#remove outliers of resolution vs mass. Adapted from Merder et al, 2020
+#https://github.com/JulianMerder/ICBM-OCEAN--Supplementary-Code-Modules
 
 ResPow_outlier <- function(dataset) {
   # Ensure dataset is a data.table
@@ -45,12 +46,13 @@ ResPow_outlier <- function(dataset) {
   
   return(dataset)
 }
-
+#calculate  noise from instrument blanks. Returns the method detection limit (MDL) at the 99% confidence interval
+#this is the upper limit to distinguish noise from real sample peaks
 MDL_master <- lapply(blank_list, function(blank){
   colnames(blank)[1] <- "m.z"
   
   
-  #following Riedel 2014
+  #following Riedel et al, 2014
   blank[, nominal_mass := floor(m.z + 0.5)]
   
   # Compute MDL for each nominal mass and return only m.z and MDL
@@ -62,9 +64,10 @@ MDL_master <- lapply(blank_list, function(blank){
   MDL_master
 })
 
-# Combine all data.tables into one
+# Combine all noise data.tables
 MDL_master <- rbindlist(MDL_master)
 
+#in case of multiple instrument blanks, calculate the mean MDL
 # Compute mean and sd of MDL for each m.z
 MDL_master <- MDL_master[, .(
   MDL = mean(MDL),
@@ -74,6 +77,7 @@ MDL_master <- MDL_master[, .(
 
 
 #########
+#this function removes peaks from samples that are below the MDL
 process_samples_MDL <- function(sample, sample_name, MDL_master) {
   # Rename column efficiently
   setnames(sample, "m/z", "m.z", skip_absent = TRUE)
@@ -102,21 +106,23 @@ process_samples_MDL <- function(sample, sample_name, MDL_master) {
 
 
 # Apply function across sample list
-MDL_water <- lapply(seq_along(sample_list), function(i) {
+samples_MDL <- lapply(seq_along(sample_list), function(i) {
   print(i)
   sample <- sample_list[[i]]
   process_samples_MDL(sample = sample, sample_name = names(sample_list)[i], MDL_master = MDL_master)
   
 })
 
-names(MDL_water)<- names(sample_list)
+names(samples_MDL)<- names(sample_list)
 
 #clean up
-rm(list = setdiff(ls(), c( "MDL_water")))
+rm(list = setdiff(ls(), c( "samples_MDL")))
 gc()
 
 #################################
 #formula processing for calibration
+#this algorithm generas very efficiently all reasonable molecular formulas within the specified boundary conditions.
+#automatically applies the NSP rule and follows the seven golden rules.
 generate_formulas <- function(C_range = 1:50, H_range = 2:120, O_range = 0:50,
                               N_range = 0:4, S_range = 0:2, P_range = 0:1,
                               mass_range = c(50, 1000), HC = c( 0.2, 3), OC = c(0, 1.2), insert_isotopes = T) {
@@ -244,6 +250,8 @@ formulas <- generate_formulas(C_range = 1:100, H_range = 2:150, O_range = 0:50, 
 #test <- generate_formulas(C_range = 1:50, H_range = 2:100, O_range = 0:50, HC= c(1,2), OC = c(0.1,1), mass_range = c(90, 800), insert_isotopes = T)
 #test 
 
+#initial molecular formula assignent function to recalibrate samples, if desired.
+#right now returns only unique assignments. If ppm is set too high, no unique solutions are found in higher mass ranges.
 formula_assignment <- function(formulas, dataset, ppm_tolerance = 0.5, ion = 1.007825032 + -1 * 0.00054857990907) {
   
   # Adjust measured m/z values
@@ -293,6 +301,8 @@ formula_assignment <- function(formulas, dataset, ppm_tolerance = 0.5, ion = 1.0
   filtered_matches
 }
 
+#this function calculates homologues network series based on the input of network differences.
+#works very fast using data.table
 calculate_connections <- function(dt,   diffs = list(
   CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
   #CH2O = c(C = 1, H = 2, O = 1, N = 0, S = 0, P = 0),
@@ -406,7 +416,8 @@ calculate_connections <- function(dt,   diffs = list(
   return(dt_with_membership = out)
 }
 
-
+#automatic recalibration of samples. Assigns all potential formulas, then narrows them down with the specified filters inside the function.
+#creates a GAM model to correct a shift of mz vs ppm of assigned formulas. Increases mass precision if a systematic drift is present.
 mz_recalibration <- function(formulas, dataset, ppm_tolerance = 0.5, ion =  1.007825032 + -1 * 0.00054857990907, S_MDL_limit = 1.5, hom_member_min = 1, showplot = T) {
   # Formula assignment and initial filtering
   filtered_matches <- formula_assignment(formulas, dataset, ppm_tolerance = ppm_tolerance, ion = ion)[P==0]#[N == 0 & S == 0 & P == 0 & C_13 == 0 & O_18 == 0 & S_34 == 0]
@@ -489,18 +500,20 @@ mz_recalibration <- function(formulas, dataset, ppm_tolerance = 0.5, ion =  1.00
   return(list(data = dataset, plot = plot))
 }
 
-
-MDL_water_recal <- lapply(MDL_water, function(dataset){
+#apply the function to all samples.
+samples_MDL_recal <- lapply(samples_MDL, function(dataset){
   res <- mz_recalibration(formulas, dataset, showplot = T,ppm_tolerance = 0.5)
 })
-names(MDL_water_recal) <- names(MDL_water)
+names(samples_MDL_recal) <- names(samples_MDL)
+#export data and plots
+samples_MDL_recal_data<- lapply(samples_MDL_recal, function(x){x$data})
+samples_MDL_recal_plots<- lapply(samples_MDL_recal, function(x){x$plot})
 
-MDL_water_recal_data<- lapply(MDL_water_recal, function(x){x$data})
-MDL_water_recal_plots<- lapply(MDL_water_recal, function(x){x$plot})
 
-
-##########all samples recalibrated. now merge?
-#merge samples and increase mass accuracy
+#merge samples and increase mass accuracy (merder et al., 2020)
+#merging of a sampleset containing similar samples can increase mass precision. If tolerance is too high, individual peaks are merged.
+#if tolerance is too low, no peaks are merged even if they are likely to be the same peak.
+#In my experience, using 2* the tolerance of the regular formula assignment should be the maximum.
 merge_mz_values <- function(dt, ppm_tolerance) {
 
   dt$I <- as.numeric(dt$I)
@@ -561,9 +574,12 @@ merge_mz_values <- function(dt, ppm_tolerance) {
 
 #combine all samples back together for increased mass precision?
 
-results_water_dt <-  merge_mz_values(rbindlist(MDL_water_recal_data), ppm_tolerance = 0.6)
+results_water_dt <-  merge_mz_values(rbindlist(samples_MDL_recal_data), ppm_tolerance = 0.6)
 
-#function for formula assignments
+#calculates the expected isotope ratio based on peak high of parent and child peak.
+#returns only peaks where parent > child and the ratio to further filter later on.
+#idea from #https://github.com/JulianMerder/ICBM-OCEAN--Supplementary-Code-Modules
+#magnitudes faster using data.table.
 calculate_isotopes <- function(filtered_matches, dataset){
   
   # Define the isotope_deviance function
@@ -743,6 +759,10 @@ calculate_isotopes <- function(filtered_matches, dataset){
   out <- rbind(parent_all, isotopes, fill =T)
 }
 
+#perform formula assignment within chosen tolerance range. Allows for the input of different ion mass  adducts (e.g. Cl, Na).
+#If return_likeliest, multi-assignments are ranked based on isotope_verification below a treshold value, the extend of homologues network series and mass difference.
+#returns a crosstable containing formulas and calculated indices.
+#Can take both single samples or merged samples from merge_mz_values as input.
 formula_assignment_multi_intensity <- function(formulas, dataset, ppm_tolerance = 0.5, ion = 1.007825032 + -1 * 0.00054857990907, threshold = 1000, return_likeliest = T,
                                                homologues_network = list(
                                                  CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
@@ -905,9 +925,13 @@ diffs <- list(
   O = c(C = 0, H = 0, O = 1, N = 0, S = 0, P = 0),
   NH3 = c(C = 0, H = 3, O = 0, N = 1, S = 0, P = 0)
 )
+#assign formulas and calculate the homologues nework series defined above
 crosstab_water_unambigous <- formula_assignment_multi_intensity(formulas, results_water_dt,ppm_tolerance = 0.3, return_likeliest = T, homologues_network = diffs)
 
 #test for Na and Cl additions?
+#this function applies a formula assignment for all samples 3 times, checking for Na and Cl adducts (in negative ESI mode. Ion mass can be adapted inside of function below.)
+#all potential formuals are assigned and kept initially, then the all output tables are checked for the most likely assignment (isotope verified, homologues series, ppm diff).
+#this works well for samples dissolved in organic solvents, e.g. toluene, that were not 100% cleaned from salts
 formula_assignment_check_adducts <- function(formulas, dataset, ppm_tolerance = 0.3,  homologues_network = list(
   CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
   CH2O = c(C = 1, H = 2, O = 1, N = 0, S = 0, P = 0),
@@ -918,9 +942,9 @@ formula_assignment_check_adducts <- function(formulas, dataset, ppm_tolerance = 
   O = c(C = 0, H = 0, O = 1, N = 0, S = 0, P = 0),
   NH3 = c(C = 0, H = 3, O = 0, N = 1, S = 0, P = 0)
 )){
-test_H <- formula_assignment_multi_intensity(formulas, dataset,ppm_tolerance = ppm_tolerance, homologues_network = homologues_network)
-test_Na <- formula_assignment_multi_intensity(formulas, dataset,ppm_tolerance = ppm_tolerance, homologues_network = homologues_network, ion = -20.974666)
-test_Cl <- formula_assignment_multi_intensity(formulas, dataset,ppm_tolerance = ppm_tolerance, homologues_network = homologues_network, ion = -34.969402)
+test_H <- formula_assignment_multi_intensity(formulas, dataset,ppm_tolerance = ppm_tolerance, homologues_network = homologues_network,return_likeliest = F)
+test_Na <- formula_assignment_multi_intensity(formulas, dataset,ppm_tolerance = ppm_tolerance, homologues_network = homologues_network,return_likeliest = F, ion = -20.974666)
+test_Cl <- formula_assignment_multi_intensity(formulas, dataset,ppm_tolerance = ppm_tolerance, homologues_network = homologues_network,return_likeliest = F, ion = -34.969402)
 
 test_H[, type := "H"]
 test_Na[, type := "Na"]
@@ -949,16 +973,21 @@ test1 <- calculate_connections ( test1,  diffs = homologues_network)
 }
 
 #unite data first in duplicates before assignment?
-data_single <- lapply(seq(1,24,2), function(i){
-  dat <- rbind(MDL_water_recal_data[[i]], MDL_water_recal_data[[i+1]])
+
+#in case of duplicate measurements of samples, where only peaks found in both samples should be kept
+data_single <- lapply(seq(1,length(samples_MDL_recal_data),2), function(i){
+  dat <- rbind(samples_MDL_recal_data[[i]], samples_MDL_recal_data[[i+1]])
   data <- merge_mz_values(dat, ppm_tolerance = 0.5)
   b <- rowMeans(data[,c(4,5)])
   idx <- which(!is.na(b))
   data <- data.table(data[idx,c(1:3),],b[idx])
 })
 
+#assign formulas onto individual samples, not the samples joined together in a porevious step. Can improve results for outlier samples
+# in my experience, dropping formulas without any connection to other formulas (homologues_membership ==1), greatly reduces noise false positive assignments.
+
 crosstab_single <- lapply(data_single, function(sample){
-  out <- formula_assignment_check_adducts(formulas,sample, ppm_tolerance = 0.3)[group != "CH" &homologues_membership >1 & C_13 ==0 & O_18 ==0 & S_34==0]
+  out <- formula_assignment_check_adducts(formulas,sample, ppm_tolerance = 0.3)[group != "CH" &homologues_membership >1]
   #apply the first filter already
   
 })
