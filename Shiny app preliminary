@@ -1,0 +1,1144 @@
+###############################################################################
+#This provides a graphical user interface to perform all calculations. 
+#Results from each step are being exported into the local R environment.
+#
+# Work in progress. No diagnostic plots and less options compared to running the functions individually
+###############################################################################
+library(bit64)
+library(shiny)
+library(data.table)
+library(quantreg)
+library(dplyr)
+library(DT)
+library(plotly)
+library(mgcv)
+library(igraph)
+
+###############################################################################
+#               Panel 1:  Functions & Shiny UI/Server Code                    #
+#                    (Instrument Blanks Noise Removal)                    #
+###############################################################################
+
+# -- Panel 1 Functions --
+# Set maximum file size (adjust as needed)
+options(shiny.maxRequestSize = 4096 * 4096 * 4096)
+
+# Function to remove outliers of resolution vs. mass
+ResPow_outlier <- function(dataset) {
+  setDT(dataset)
+  d <- rq(log(ResPow) ~ log(m.z), data = dataset, method = "fn")
+  j <- density(d$residuals)
+  ex <- data.table(x = j$x[-1], y = diff(j$y))
+  ex <- ex[x > 0]
+  ex <- ex[which.min(y):.N]
+  e <- ex[y > 0, x[1]]
+  if (is.na(e)) e <- Inf
+  dataset <- dataset[d$residuals <= abs(e)]
+  return(dataset)
+}
+
+# Function to process samples and remove peaks below MDL
+process_samples_MDL <- function(sample, sample_name, MDL_master) {
+  setnames(sample, "m/z", "m.z", skip_absent = TRUE)
+  sample[, nominal_mz := floor(m.z + 0.5)]
+  merged_data <- merge(sample, MDL_master, by.x = "nominal_mz", by.y = "m.z", all.x = TRUE)
+  data <- merged_data[I >= MDL, .(
+    m.z = m.z, 
+    I = I, 
+    MDL = MDL, 
+    ResPow = Res., 
+    index = sample_name
+  )]
+  data <- ResPow_outlier(data)
+  return(data)
+}
+
+# -- Panel 1 UI --
+panel1_ui <- fluidPage(
+  titlePanel("Instrument Blanks Noise Removal"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("blanks_files", "Select Instrument blank file(s):", 
+                multiple = TRUE, accept = c(".csv")),
+      fileInput("samples_files", "Select sample files:", 
+                multiple = TRUE, accept = c(".csv")),
+      numericInput("confidence_level", "Confidence Level:", value = 0.998, min = 0, max = 1, step = 0.001),
+      actionButton("calculate", "Calculate (Panel 1)")
+    ),
+    
+    mainPanel(
+      verbatimTextOutput("status"),
+      tableOutput("results"),
+      tableOutput("overview")
+    )
+  )
+)
+
+# -- Panel 1 Server --
+panel1_server <- function(input, output, session) {
+  
+  blanks_data <- reactive({
+    req(input$blanks_files)
+    lapply(input$blanks_files$datapath, fread)
+  })
+  
+  samples_data <- reactive({
+    req(input$samples_files)
+    samples <- lapply(input$samples_files$datapath, fread)
+    names(samples) <- tools::file_path_sans_ext(basename(input$samples_files$name))
+    samples
+  })
+  
+  samples_MDL <- eventReactive(input$calculate, {
+    req(blanks_data(), samples_data())
+    
+    blank_list <- blanks_data()
+    sample_list <- samples_data()
+    
+    # Compute MDL_master
+    MDL_master <- lapply(blank_list, function(blank) {
+      colnames(blank)[1] <- "m.z"
+      blank[, nominal_mass := floor(m.z + 0.5)]
+      blank[, .(
+        MDL = qt(input$confidence_level, df = .N - 1) * sd(I) + mean(I)
+      ), by = nominal_mass]
+    })
+    
+    MDL_master <- rbindlist(MDL_master)
+    MDL_master <- MDL_master[, .(MDL = mean(MDL), sd = sd(MDL)), by = nominal_mass]
+    setnames(MDL_master, "nominal_mass", "m.z")
+    
+    # Process samples
+    processed_samples <- lapply(seq_along(sample_list), function(i) {
+      sample <- sample_list[[i]]
+      process_samples_MDL(sample, names(sample_list)[i], MDL_master)
+    })
+    
+    names(processed_samples) <- names(sample_list)
+    
+    # Export processed_samples to the global environment
+    assign("samples_MDL", processed_samples, envir = .GlobalEnv)
+    
+    processed_samples
+  })
+  
+  overview_data <- eventReactive(input$calculate, {
+    req(samples_MDL())
+    sample_list <- samples_data()
+    processed_samples <- samples_MDL()
+    
+    overview <- data.table(
+      Sample_Name = names(sample_list),
+      Rows_Before = sapply(sample_list, nrow),
+      Rows_After = sapply(processed_samples, nrow),
+      Min_mz = sapply(processed_samples, function(x) min(x$m.z, na.rm = TRUE)),
+      Max_mz = sapply(processed_samples, function(x) max(x$m.z, na.rm = TRUE))
+    )
+    
+    return(overview)
+  })
+  
+  output$status <- renderPrint({
+    req(samples_MDL())
+    paste("Processing complete. Processed", length(samples_MDL()), "samples.")
+  })
+  
+  output$results <- renderTable({
+    req(samples_data())
+    head(samples_data()[[1]]) # Display the first few rows of the first sample
+  })
+  
+  output$overview <- renderTable({
+    req(overview_data())
+    overview_data()
+  })
+}
+
+###############################################################################
+#               Panel 2:  Functions & Shiny UI/Server Code                    #
+#                      (Molecular Formula Generator)                          #
+###############################################################################
+
+# -- Panel 2 Functions --
+generate_formulas <- function(C_range, H_range, O_range, N_range, S_range, P_range,
+                              mass_range, HC, OC, insert_isotopes) {
+  mass_C  <- 12.00000000
+  mass_H  <- 1.00782503
+  mass_O  <- 15.99491463
+  mass_N  <- 14.00307400
+  mass_S  <- 31.97207117
+  mass_P  <- 30.97376203
+  
+  dt <- CJ(C = C_range, N = N_range, S = S_range, P = P_range)
+  dt <- dt[C > 0 & (N / C) <= 1.3 & (S / C) <= 0.8 & (P / C) <= 0.3]
+  dt <- dt[!(N > 1 & (S + P > 0)) & !(N != 0 & S != 0 & P != 0) & !(S + P > 2) & !(N == 1 & (S > 1 | P > 1))]
+  
+  dt[, `:=`(H_min = pmax(ceiling(HC[1] * C), H_range[1]),
+            H_max = pmin(floor(HC[2] * C), max(H_range)),
+            O_max = pmin(floor(OC[2] * C), max(O_range)))]
+  
+  results <- dt[, {
+    if (H_min <= H_max) {
+      H_values <- H_min:H_max
+      O_values <- 0:O_max
+      H_O_dt <- CJ(H = H_values, O = O_values)
+      H_O_dt <- H_O_dt[(H / C) >= HC[1] & (H / C) <= HC[2] & (O / C) <= OC[2] & (O / C) >= OC[1]]
+    } else {
+      H_O_dt <- NULL
+    }
+    H_O_dt
+  }, by = .(C, N, S, P)]
+  
+  results[, `:=`(DBE = 1 + (2 * C - H + N + P) / 2,
+                 valence = C * 4 + H * 1 + O * 2 + N * 3 + S * 2 + P * 5)]
+  results <- results[DBE >= 0 & DBE %% 1 == 0 & valence %% 2 == 0]
+  results[, `:=`(valence = NULL, DBE = NULL)]
+  
+  results[, mz := C * mass_C + H * mass_H + O * mass_O + N * mass_N + S * mass_S + P * mass_P]
+  results <- results[mz >= mass_range[1] & mz <= mass_range[2]]
+  
+  if (insert_isotopes) {
+    results[, `:=`(max_O18 = pmin(1, O),
+                   max_C13 = pmin(2, C),
+                   max_S34 = pmin(1, S))]
+    
+    isotope_combinations <- function(formulas_dt) {
+      isotope_grid <- CJ(O_18 = 0:max(formulas_dt$max_O18),
+                         C_13 = 0:max(formulas_dt$max_C13),
+                         S_34 = 0:max(formulas_dt$max_S34))
+      
+      isotope_grid <- isotope_grid[
+        (O_18 + S_34 + C_13 == 1) | (C_13 == 2 & O_18 == 0 & S_34 == 0)
+      ]
+      
+      expanded_formulas <- formulas_dt[rep(1:.N, each = nrow(isotope_grid))]
+      expanded_isotopes <- isotope_grid[rep(1:.N, times = formulas_dt[, .N])]
+      combined_formulas <- cbind(expanded_formulas, expanded_isotopes)
+      
+      combined_formulas <- combined_formulas[
+        (C_13 > 0 & O_18 == 0 & S_34 == 0) |
+          ((S_34 > 0 & S > 0) | (O_18 > 0 & O > 0))
+      ]
+      
+      combined_formulas[, mz := C * mass_C + H * mass_H + O * mass_O + N * mass_N + S * mass_S + P * mass_P +
+                          C_13 * (13.00335540 - mass_C) +
+                          O_18 * (17.99915960 - mass_O) +
+                          S_34 * (33.96786690 - mass_S)]
+      combined_formulas <- combined_formulas[mz >= mass_range[1] & mz <= mass_range[2]]
+      combined_formulas
+    }
+    
+    results_isotopes <- isotope_combinations(results)
+    results <- rbind(results, results_isotopes, use.names = TRUE, fill = TRUE)
+  } else {
+    new_columns <- c("O_18", "C_13", "S_34")
+    results[, (new_columns) := 0]
+  }
+  
+  results <- results[, .(C, H, O, N, S, P, C_13, O_18, S_34, calculated_m.z = mz)]
+  results[is.na(results)] <- 0
+  setorder(results, calculated_m.z)
+  results
+}
+
+# -- Panel 2 UI --
+panel2_ui <- fluidPage(
+  titlePanel("Molecular Formula Generator"),
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("C_range", "C Range:", min = 1, max = 100, value = c(1, 50)),
+      sliderInput("H_range", "H Range:", min = 1, max = 200, value = c(2, 120)),
+      sliderInput("O_range", "O Range:", min = 0, max = 100, value = c(0, 50)),
+      sliderInput("N_range", "N Range:", min = 0, max = 10, value = c(0, 4)),
+      sliderInput("S_range", "S Range:", min = 0, max = 5, value = c(0, 2)),
+      sliderInput("P_range", "P Range:", min = 0, max = 5, value = c(0, 1)),
+      sliderInput("mass_range", "Mass Range:", min = 0, max = 2000, value = c(90, 1000)),
+      sliderInput("HC", "H/C Range:", min = 0, max = 5, value = c(0.2, 3), step = 0.1),
+      sliderInput("OC", "O/C Range:", min = 0, max = 4, value = c(0, 1.2), step = 0.1),
+      checkboxInput("insert_isotopes", "Insert Isotopes", value = TRUE),
+      actionButton("calc_button", "Calculate Formulas (Panel 2)")
+    ),
+    mainPanel(
+      DTOutput("results_table"),
+      verbatimTextOutput("calc_message")
+    )
+  )
+)
+
+# -- Panel 2 Server --
+panel2_server <- function(input, output, session) {
+  
+  results <- eventReactive(input$calc_button, {
+    generate_formulas(
+      C_range = input$C_range[1]:input$C_range[2],
+      H_range = input$H_range[1]:input$H_range[2],
+      O_range = input$O_range[1]:input$O_range[2],
+      N_range = input$N_range[1]:input$N_range[2],
+      S_range = input$S_range[1]:input$S_range[2],
+      P_range = input$P_range[1]:input$P_range[2],
+      mass_range = input$mass_range,
+      HC = input$HC,
+      OC = input$OC,
+      insert_isotopes = input$insert_isotopes
+    )
+  })
+  
+  output$results_table <- renderDT({
+    results()
+  })
+  
+  observeEvent(input$calc_button, {
+    assign("formulas", results(), envir = .GlobalEnv)
+    output$calc_message <- renderText({
+      "Calculation complete. Results saved to 'formulas' in your R environment."
+    })
+  })
+}
+
+###############################################################################
+#               Panel 3:  Functions & Shiny UI/Server Code                    #
+#                      (MZ Recalibration Tool)                                #
+###############################################################################
+
+# -- Panel 3 Functions --
+formula_assignment <- function(formulas, dataset, ppm_tolerance = 0.5, 
+                               ion = 1.007825032 + -1 * 0.00054857990907) {
+  dataset$m.z_ion <- dataset$m.z
+  dataset$m.z <- dataset$m.z + ion
+  
+  dataset[, `:=`(
+    lower_limit = m.z * (1 - ppm_tolerance / 1e6),
+    upper_limit = m.z * (1 + ppm_tolerance / 1e6)
+  )]
+  
+  formulas[, `:=`(start = calculated_m.z, end = calculated_m.z)]
+  
+  setkey(formulas, start, end)
+  setkey(dataset, lower_limit, upper_limit)
+  final_matches <- foverlaps(formulas, dataset, 
+                             by.x = c("start", "end"), 
+                             by.y = c("lower_limit", "upper_limit"), 
+                             type = "within", nomatch = 0)
+  
+  final_matches[, absolute_error := calculated_m.z - m.z]
+  final_matches[, ppm := (absolute_error / m.z) * 1e6]
+  
+  filtered_matches <- final_matches[, .(m.z_ion, m.z, calculated_m.z, absolute_error, ppm,
+                                        C, H, O, N, S, P , C_13, O_18, S_34, I, MDL)]
+  
+  unique_mz <- filtered_matches[, .N, by = m.z][N == 1, m.z]
+  filtered_matches <- filtered_matches[m.z %in% unique_mz]
+  
+  filtered_matches
+}
+
+calculate_connections <- function(dt, diffs = list(
+  CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
+  H   = c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
+)) {
+  setorder(dt, C, H, O)
+  dt[, index := .I]
+  dt[, group := fifelse(N > 0 & P > 0, "NP", 
+                        fifelse(N > 0 & (S > 0 | S_34 > 0), "NS", 
+                                fifelse((S > 0 | S_34 > 0) & P > 0, "SP", 
+                                        fifelse(N > 0 & S == 0 & P == 0 & S_34 == 0, "N", 
+                                                fifelse((S > 0 | S_34 > 0) & N == 0 & P == 0, "S", 
+                                                        fifelse(P > 0 & S == 0 & N == 0 & S_34 == 0, "P", 
+                                                                fifelse(O > 0 & P == 0 & S == 0 & N == 0 & S_34 == 0, "CHO", 
+                                                                        fifelse(O == 0 & P == 0 & S == 0 & N == 0 & S_34 == 0, "CH", "None"))))))))]
+  
+  results <- list()
+  
+  calculate_group_connections <- function(dt_group) {
+    dt_group_unique <- dt_group
+    group_results <- list()
+    
+    for (diff_name in names(diffs)) {
+      diff_vector <- diffs[[diff_name]]
+      
+      diff_dt <- dt_group_unique[, .(
+        C = C + diff_vector["C"],
+        H = H + diff_vector["H"],
+        O = O + diff_vector["O"],
+        N = N + diff_vector["N"],
+        S = S + diff_vector["S"],
+        P = P + diff_vector["P"],
+        from_index = index
+      )]
+      
+      setkeyv(diff_dt, c("C", "H", "O", "N", "S", "P"))
+      setkeyv(dt_group_unique, c("C", "H", "O", "N", "S", "P"))
+      
+      matched <- dt_group_unique[diff_dt, nomatch = 0L]
+      
+      if (nrow(matched) > 0) {
+        connections <- matched[, .(
+          from_index = from_index,
+          to_index = index,
+          connection_type = diff_name
+        )]
+        group_results[[diff_name]] <- connections
+      }
+    }
+    
+    all_group_connections <- rbindlist(group_results, use.names = TRUE, fill = TRUE)
+    no_connections <- dt_group_unique[!index %in% unique(c(all_group_connections$from_index, all_group_connections$to_index)), .(
+      from_index = index,
+      to_index = NA,
+      connection_type = "No Connection"
+    )]
+    
+    all_group_connections <- rbind(all_group_connections, no_connections, fill = TRUE)
+    return(all_group_connections)
+  }
+  
+  for (grp in unique(dt$group)) {
+    dt_group <- dt[group == grp]
+    group_connections <- calculate_group_connections(dt_group)
+    results[[grp]] <- group_connections
+  }
+  
+  all_connections <- rbindlist(results, use.names = TRUE, fill = TRUE)
+  Ak <- graph_from_data_frame(all_connections[!is.na(to_index)], directed = FALSE) %>% components()
+  membership_dt <- data.table(index = as.integer(names(Ak$membership)), homologues_membership = Ak$membership)
+  membership_dt[, homologues_membership := .N, by = homologues_membership]
+  out <- merge(dt, membership_dt, by = "index", all.x = TRUE)
+  out[is.na(homologues_membership), homologues_membership := 1]
+  
+  return(out)
+}
+
+mz_recalibration <- function(formulas, dataset, ppm_tolerance = 0.5, 
+                             ion = 1.007825032 + -1 * 0.00054857990907, 
+                             S_MDL_limit = 1.5, hom_member_min = 1, showplot = TRUE) {
+  filtered_matches <- formula_assignment(formulas, dataset, ppm_tolerance = ppm_tolerance, ion = ion)[P == 0]
+  out <- filtered_matches[I / MDL > S_MDL_limit]
+  
+  if (nrow(out) > 20) {
+    out <- calculate_connections(out)
+    out <- out[homologues_membership >= hom_member_min]
+  }
+  
+  if (nrow(out) > 20) {
+    Q1 <- quantile(out$ppm, 0.25)
+    Q3 <- quantile(out$ppm, 0.75)
+    IQR <- Q3 - Q1
+    bounds <- c(Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
+    out <- out[ppm > bounds[1] & ppm < bounds[2]]
+    
+    gam_model <- gam(ppm ~ s(m.z, bs = "cs", k = 4), data = out)
+    
+    correct_new_data <- function(m.z, gam_model) {
+      new_data <- data.table(m.z)
+      new_data[, predicted_drift_ppm := predict(gam_model, newdata = new_data)]
+      new_data[, corrected_mz := m.z * (1 + predicted_drift_ppm / 1e6)]
+      return(new_data)
+    }
+    
+    pred <- correct_new_data(dataset$m.z, gam_model)
+    dataset[, m.z := pred$corrected_mz]
+    
+    if (showplot) {
+      pred <- subset(pred, m.z < max(filtered_matches$m.z))
+      
+      filtered_matches_2 <- formula_assignment(formulas, dataset, ppm_tolerance = ppm_tolerance, ion = ion)[P == 0]
+      out2 <- filtered_matches_2[I / MDL > S_MDL_limit]
+      out2 <- calculate_connections(out2)[homologues_membership >= hom_member_min]
+      
+      Q1_2 <- quantile(out2$ppm, 0.25)
+      Q3_2 <- quantile(out2$ppm, 0.75)
+      IQR_2 <- Q3_2 - Q1_2
+      bounds_2 <- c(Q1_2 - 1.5 * IQR_2, Q3_2 + 1.5 * IQR_2)
+      out2 <- out2[ppm > bounds_2[1] & ppm < bounds_2[2]]
+      
+      plot1 <- plot_ly() %>%
+        add_trace(
+          data = filtered_matches, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
+          marker = list(color = 'grey', size = 5), name = 'All assignments'
+        ) %>%
+        add_trace(
+          data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
+          marker = list(color = 'black', size = 5), name = 'Filtered assignments'
+        ) %>%
+        add_trace(
+          data = out, x = pred$corrected_mz, y = pred$predicted_drift_ppm, type = 'scatter', mode = 'lines',
+          line = list(color = 'red', width = 2), name = 'GAM Model'
+        ) %>%
+        layout(title = dataset$index[1], xaxis = list(title = "m/z"), yaxis = list(title = "ppm"))
+      
+      plot2 <- plot_ly() %>%
+        add_trace(
+          data = filtered_matches_2, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
+          marker = list(color = 'grey', size = 5), name = 'All assignments', showlegend = FALSE
+        ) %>%
+        add_trace(
+          data = out2, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
+          marker = list(color = 'black', size = 5), name = 'Filtered assignments', showlegend = FALSE
+        ) %>%
+        layout(xaxis = list(title = "m/z"), yaxis = list(title = "ppm"))
+      
+      plot <- subplot(plot1, plot2, shareY = TRUE, titleX = TRUE, titleY = TRUE)
+      print(paste0(dataset$index[1], " SSE before: ", round(sum(out$ppm^2), 2),
+                   "| SSE after: ", round(sum(out2$ppm^2), 2)))
+    } else {
+      plot <- plot_ly()
+    }
+    dataset <- dataset[, .(m.z, I, MDL, ResPow, index)]
+  } else {
+    print(paste0(dataset$index[1], " Not enough points"))
+    plot <- plot_ly()
+  }
+  
+  print(paste0("Finished ", dataset$index[1]))
+  return(list(data = dataset, plot = plot))
+}
+
+# -- Panel 3 UI --
+panel3_ui <- fluidPage(
+  titlePanel("MZ Recalibration Tool"),
+  sidebarLayout(
+    sidebarPanel(
+      numericInput("ppm_tolerance", "ppm tolerance:", value = 0.5, min = 0, step = 0.1),
+      numericInput("S_MDL_limit", "S/MDL lower limit:", value = 1.5, min = 0, step = 0.1),
+      numericInput("hom_member_min", "Homologue network length min:", value = 1, min = 1, step = 1),
+      actionButton("calculate_mz", "Calculate (Panel 3)"),
+      actionButton("prev", "Previous Sample"),
+      actionButton("next_sample", "Next Sample")
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Plot", plotlyOutput("mz_plot"))
+      )
+    )
+  )
+)
+
+# -- Panel 3 Server --
+panel3_server <- function(input, output, session) {
+  
+  # We'll store the list of recalibration results here
+  recal_data <- reactiveVal(NULL)
+  current_sample <- reactiveVal(1)
+  
+  # Event to trigger recalibration of all "samples_MDL" with "formulas"
+  observeEvent(input$calculate_mz, {
+    
+    # Make sure "samples_MDL" and "formulas" exist in .GlobalEnv
+    if (!exists("samples_MDL", envir = .GlobalEnv)) {
+      showNotification("Error: 'samples_MDL' not found in global environment.", type = "error")
+      return(NULL)
+    }
+    if (!exists("formulas", envir = .GlobalEnv)) {
+      showNotification("Error: 'formulas' not found in global environment.", type = "error")
+      return(NULL)
+    }
+    
+    local_samples <- get("samples_MDL", envir = .GlobalEnv)
+    local_formulas <- get("formulas", envir = .GlobalEnv)
+    
+    # Recalibration
+    out_list <- lapply(local_samples, function(dataset) {
+      mz_recalibration(local_formulas, dataset,
+                       ppm_tolerance = input$ppm_tolerance,
+                       S_MDL_limit = input$S_MDL_limit,
+                       hom_member_min = input$hom_member_min,
+                       showplot = TRUE)
+    })
+    
+    # Save the list of results
+    recal_data(out_list)
+    
+    # Extract the data portion and assign to the global environment
+    data_only_list <- lapply(out_list, function(x) x$data)
+    assign("samples_MDL_recal_data", data_only_list, envir = .GlobalEnv)
+    showNotification("MZ Recalibration complete! 'samples_MDL_recal_data' saved globally.", type = "message")
+    
+    current_sample(1)
+  })
+  
+  # Navigation for the plot
+  observeEvent(input$next_sample, {
+    req(recal_data())
+    current_sample(min(current_sample() + 1, length(recal_data())))
+  })
+  
+  observeEvent(input$prev, {
+    req(recal_data())
+    current_sample(max(current_sample() - 1, 1))
+  })
+  
+  # Render Plot for the current sample
+  output$mz_plot <- renderPlotly({
+    req(recal_data())
+    idx <- current_sample()
+    if (idx > 0 && idx <= length(recal_data())) {
+      recal_data()[[idx]]$plot
+    }
+  })
+}
+
+###############################################################################
+#               Panel 4:  Functions & Shiny UI/Server Code                    #
+#                      (Merge m/z Values)                                     #
+###############################################################################
+
+# -- Panel 4 Functions --
+merge_mz_values <- function(dt, ppm_tolerance) {
+  dt$I <- as.numeric(dt$I)
+  colnames(dt)[3] <- "MDL"
+  colnames(dt)[1] <- "mz"
+  setorder(dt, mz)
+  dt[, diff_ppm := c(Inf, diff(mz)) / mz * 1e6]
+  dt[, group := cumsum(diff_ppm > ppm_tolerance)]
+  merged <- dt[, {
+    sqrt_I <- sqrt(I)
+    sum_sqrt_I <- sum(sqrt_I)
+    sum_mz_sqrt_I <- sum(mz * sqrt_I)
+    weighted_mz <- sum_mz_sqrt_I / sum_sqrt_I
+    .(merged_mz = weighted_mz, mean_MDL = MDL[1], SE = sd(mz) / weighted_mz * 1e6)
+  }, by = .(group)]
+  dt <- merge(dt, merged, by = "group", all.x = TRUE)
+  dt2 <- dt[, .SD[1], by = .(group, index)]
+  dt_wide <- dcast(dt2, merged_mz + mean_MDL + SE ~ index, value.var = "I", fill = NA)
+  colnames(dt_wide)[c(1, 2)] <- c("m.z", "MDL")
+  return(dt_wide)
+}
+
+# -- Panel 4 UI --
+panel4_ui <- fluidPage(
+  titlePanel("Merge m/z Values"),
+  sidebarLayout(
+    sidebarPanel(
+      numericInput("ppm_tolerance_merge", "PPM Tolerance:", value = 0.6, min = 0, step = 0.1),
+      actionButton("calculate_merge", "Calculate (Panel 4)")
+    ),
+    mainPanel(
+      verbatimTextOutput("status_merge")
+    )
+  )
+)
+
+# -- Panel 4 Server --
+panel4_server <- function(input, output, session) {
+  
+  observeEvent(input$calculate_merge, {
+    # Ensure samples_MDL_recal_data exists
+    if (!exists("samples_MDL_recal_data", envir = .GlobalEnv)) {
+      output$status_merge <- renderText("Error: 'samples_MDL_recal_data' is not found in the global environment.")
+      return(NULL)
+    }
+    
+    # Perform the calculation
+    output$status_merge <- renderText("Calculating...")
+    
+    tryCatch({
+      local_samples <- get("samples_MDL_recal_data", envir = .GlobalEnv)
+      combined_dt <- rbindlist(local_samples, fill = TRUE)
+      result_dt <- merge_mz_values(combined_dt, ppm_tolerance = input$ppm_tolerance_merge)
+      
+      # Assign result to global environment
+      assign("merged_samples", result_dt, envir = .GlobalEnv)
+      
+      output$status_merge <- renderText("Calculation complete! Check the global environment for 'merged_samples'.")
+    }, error = function(e) {
+      output$status_merge <- renderText(paste("Error:", e$message))
+    })
+  })
+}
+
+###############################################################################
+#               Panel 5:  Functions & Shiny UI/Server Code                    #
+#              (Formula Assignment and Isotope Calculation)                   #
+###############################################################################
+
+# -- Panel 5 Functions --
+calculate_isotopes <- function(filtered_matches, dataset){
+  
+  # Define the isotope_deviance function
+  isotope_deviance <- function(intensity_parent, intensity_child, number_of_atoms, q, p, number_of_isotopes = 1) {
+    expected_intensity_ratio <- dbinom(number_of_isotopes, number_of_atoms, q) / dbinom(number_of_atoms, number_of_atoms, p)
+    ratio <- (intensity_child / intensity_parent)
+    
+    # Vectorized weighted mean with na.rm
+    rdeviance_weighted <- ((weighted.mean(ratio, intensity_parent, na.rm = TRUE) / expected_intensity_ratio) - 1) * 1000
+    return(rdeviance_weighted)
+  }
+  
+  
+  
+  
+  # Select intensity columns
+  intensity_cols <- setdiff(names(dataset), c("m.z", "MDL", "SE", "ResPow", "m.z_ion","index"))
+  
+  # Check if there's more than one column, and apply rowMeans conditionally
+  if (length(intensity_cols) > 1) {
+    # If more than one intensity column, calculate rowMeans and keep m.z
+    intensities <- dataset[, .(m.z, intensities = rowMeans(.SD, na.rm = TRUE)), .SDcols = intensity_cols]
+  } else {
+    # If only one intensity column, keep m.z and the single intensity column
+    intensities <- dataset[, .(m.z, intensities = get(intensity_cols))]
+  }
+  
+  # Merge intensities into filtered_matches
+  filtered_matches <- merge(filtered_matches, intensities, by.x = "m.z", by.y = "m.z", all.x = TRUE)
+  
+  # Subset parent and child isotopes using data.table filtering
+  parent_all <- filtered_matches[C_13 == 0 & O_18 == 0 & S_34 == 0]
+  child_C_1_all <- filtered_matches[C_13 == 1 & O_18 == 0 & S_34 == 0]
+  child_C_2_all <- filtered_matches[C_13 == 2 & O_18 == 0 & S_34 == 0]
+  child_O_all <- filtered_matches[C_13 == 0 & O_18 == 1 & S_34 == 0]
+  child_S_all <- filtered_matches[C_13 == 0 & O_18 == 0 & S_34 == 1]
+  
+  # Perform the merges and filtering
+  
+  
+  result_C1 <- merge(parent_all, child_C_1_all, 
+                     by = c("C", "H", "O", "N", "S", "P"),
+                     all = FALSE, suffixes = c("_parent", "_child"))
+  result_C2 <- merge(parent_all, child_C_2_all, 
+                     by = c("C", "H", "O", "N", "S", "P"),
+                     all = FALSE, suffixes = c("_parent", "_child"))
+  
+  result_O <- merge(parent_all, child_O_all, 
+                    by = c("C", "H", "O", "N", "S", "P"),
+                    all = FALSE, suffixes = c("_parent", "_child"))
+  
+  result_S <- merge(parent_all, child_S_all, 
+                    by = c("C", "H", "O", "N", "S", "P"),
+                    all = FALSE, suffixes = c("_parent", "_child"))
+  
+  result_C1 <- result_C1[intensities_parent > intensities_child]
+  
+  result_C2 <- result_C2[intensities_parent > intensities_child]
+  
+  result_O <- result_O[intensities_parent > intensities_child]
+  
+  result_S <- result_S[intensities_parent > intensities_child]
+  
+  
+  #remove all non-matches?
+  colnames_parent <- paste0("intensities" ,"_parent")
+  colnames_child <- paste0("intensities", "_child")
+  
+  #can actually pre-compute the expected ratio for each C/O/S already
+  #does not seem to be necessary though, already extremely fast
+  
+  
+  # Calculate isotope deviance
+  result_C1[, isotope_deviance_C_13_1 := isotope_deviance(
+    intensity_parent = as.numeric(get(colnames_parent)),    # Column from parent
+    intensity_child = as.numeric(get(colnames_child)),      # Column from child
+    number_of_atoms = C,                   
+    q = 0.0108,                             
+    p = 1-0.0108,
+    number_of_isotopes =1
+  ), by = seq_len(nrow(result_C1))]
+  
+  result_C2[, isotope_deviance_C_13_2 := isotope_deviance(
+    intensity_parent = as.numeric(get(colnames_parent)),    # Column from parent
+    intensity_child = as.numeric(get(colnames_child)),      # Column from child
+    number_of_atoms = C,                   
+    q = 0.0108,                             
+    p = 1-0.0108,
+    number_of_isotopes =2
+  ), by = seq_len(nrow(result_C2))]
+  
+  result_O[, isotope_deviance_O_18 := isotope_deviance(
+    intensity_parent = as.numeric(get(colnames_parent)),    # Column from parent
+    intensity_child = as.numeric(get(colnames_child)),      # Column from child
+    number_of_atoms = O,                   
+    q = 0.00205,                             
+    p = 1-0.00205,
+    number_of_isotopes =1
+  ), by = seq_len(nrow(result_O))]
+  
+  result_S[, isotope_deviance_S_34 := isotope_deviance(
+    intensity_parent = as.numeric(get(colnames_parent)),    # Column from parent
+    intensity_child = as.numeric(get(colnames_child)),      # Column from child
+    number_of_atoms = S,                   
+    q = 0.0437,                             
+    p = 1-0.0437,
+    number_of_isotopes =1
+  ), by = seq_len(nrow(result_S))]
+  
+  result <-rbind(parent_all, result_C1, result_C2, result_O, result_S, fill = T)
+  #child and parent columns need to be un-merged.
+  
+  
+  # Identify columns with '_parent' and '_child'
+  parent_cols <- grep("_parent$", colnames(result_C1), value = TRUE)
+  child_cols <- grep("_child$", colnames(result_C1), value = TRUE)
+  
+  # Combine with C H O N S P columns (which are common)
+  common_cols <- c("C", "H", "O", "N", "S", "P")
+  
+  # Create separate data.tables for parent and child
+  parent_C1 <- result_C1[, c(common_cols, parent_cols,"isotope_deviance_C_13_1"), with = FALSE]
+  result_C1 <- result_C1[, c(common_cols, child_cols,"isotope_deviance_C_13_1"), with = FALSE]
+  
+  parent_C2 <- result_C2[, c(common_cols, parent_cols,"isotope_deviance_C_13_2"), with = FALSE]
+  result_C2 <- result_C2[, c(common_cols, child_cols,"isotope_deviance_C_13_2"), with = FALSE]
+  
+  parent_O <- result_O[, c(common_cols, parent_cols,"isotope_deviance_O_18"), with = FALSE]
+  result_O <- result_O[, c(common_cols, child_cols,"isotope_deviance_O_18"), with = FALSE]
+  
+  parent_S <- result_S[, c(common_cols, parent_cols,"isotope_deviance_S_34"), with = FALSE]
+  result_S <- result_S[, c(common_cols, child_cols,"isotope_deviance_S_34"), with = FALSE]
+  
+  # Optionally, remove the '_parent' and '_child' suffixes for better readability
+  setnames(parent_C1, gsub("_parent$", "", colnames(parent_C1)))
+  setnames(result_C1, gsub("_child$", "", colnames(result_C1)))
+  setnames(parent_C2, gsub("_parent$", "", colnames(parent_C2)))
+  setnames(result_C2, gsub("_child$", "", colnames(result_C2)))
+  setnames(parent_O, gsub("_parent$", "", colnames(parent_O)))
+  setnames(result_O, gsub("_child$", "", colnames(result_O)))
+  setnames(parent_S, gsub("_parent$", "", colnames(parent_S)))
+  setnames(result_S, gsub("_child$", "", colnames(result_S)))
+  
+  parent_C1[, intensities := NULL]
+  parent_C2[, intensities := NULL]
+  parent_O[, intensities := NULL]
+  parent_S[, intensities := NULL]
+  result_C1[, intensities := NULL]
+  result_C2[, intensities := NULL]
+  result_O[, intensities := NULL]
+  result_S[, intensities := NULL]
+  
+  parent_all[, intensities := NULL]
+  
+  
+  # parents <- merge(parent_C1, parent_C2, 
+  #                  by = colnames(parent_C1)[-ncol(parent_C1)], all = T) #in this case drop non-matches for C2, exclude isotope peaks for C2 where no C1 is present
+  # idx <-which(is.na(parents$isotope_deviance_C_13_1))
+  # parents <- parents [-idx,]
+  # parents <- merge(parents, parent_O, 
+  #                  by = colnames(parent_C1)[-ncol(parent_C1)], all = T)
+  # parents <- merge(parents, parent_S, 
+  #                  by = colnames(parent_C1)[-ncol(parent_C1)], all = T)
+  isotopes <-merge(result_C1, result_C2, 
+                   by = colnames(result_C1)[-ncol(result_C1)], all = T) 
+  #idx <-which(is.na(isotopes$isotope_deviance_C_13_1))
+  #isotopes <- isotopes [-idx,]
+  isotopes <- merge(isotopes, result_O, 
+                    by = colnames(parent_C1)[-ncol(parent_C1)], all = T)
+  isotopes <- merge(isotopes, result_S, 
+                    by = colnames(parent_C1)[-ncol(parent_C1)], all = T)
+  #final_data <- merge(filtered_matches, parents,by = colnames(parent_C1)[-ncol(parent_C1)], all = T)
+  #...and so on for other isotopes. Insert for parent as well?
+  
+  # final <- merge(isotopes, parents, 
+  #                            by = colnames(isotopes), all = T)
+  out <- rbind(parent_all, isotopes, fill =T)
+}
+
+calculate_connections_panel5 <- function(dt,   
+                                         diffs = list(
+                                           CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
+                                           H   = c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
+                                         )) {
+  setorder(dt, C, H, O)
+  dt[, index := .I]
+  dt[, group := fifelse(N > 0 & P > 0 , "NP", 
+                        fifelse(N > 0 & (S > 0 | S_34 > 0), "NS", 
+                                fifelse((S > 0 | S_34 > 0) & P > 0, "SP", 
+                                        fifelse(N > 0 & S == 0 & P ==0 & S_34 ==0 , "N", 
+                                                fifelse((S > 0 | S_34 > 0) & N == 0 & P ==0 , "S", 
+                                                        fifelse(P > 0 & S == 0 & N ==0 & S_34 ==0 , "P", 
+                                                                fifelse(O > 0 & P == 0 & S == 0 & N ==0 & S_34  == 0, "CHO", 
+                                                                        fifelse(O == 0 & P == 0 & S == 0 & N ==0 & S_34 ==0 , "CH",
+                                                                                "None"))))))))]
+  
+  results <- list()
+  
+  calculate_group_connections <- function(dt_group) {
+    dt_group_unique <- dt_group
+    group_results <- list()
+    
+    for (diff_name in names(diffs)) {
+      diff_vector <- diffs[[diff_name]]
+      diff_dt <- dt_group_unique[, .(
+        C = C + diff_vector["C"],
+        H = H + diff_vector["H"],
+        O = O + diff_vector["O"],
+        N = N + diff_vector["N"],
+        S = S + diff_vector["S"],
+        P = P + diff_vector["P"],
+        from_index = index
+      )]
+      
+      setkeyv(diff_dt, c("C", "H", "O", "N", "S", "P"))
+      setkeyv(dt_group_unique, c("C", "H", "O", "N", "S", "P"))
+      matched <- dt_group_unique[diff_dt, nomatch = 0L]
+      
+      if (nrow(matched) > 0) {
+        connections <- matched[, .(
+          from_index = from_index,
+          to_index = index,
+          connection_type = diff_name
+        )]
+        group_results[[diff_name]] <- connections
+      }
+    }
+    
+    all_group_connections <- rbindlist(group_results, use.names = TRUE, fill = TRUE)
+    
+    no_connections <- dt_group_unique[!index %in% unique(c(all_group_connections$from_index, all_group_connections$to_index)), .(
+      from_index = index,
+      to_index = NA,
+      connection_type = "No Connection"
+    )]
+    all_group_connections <- rbind(all_group_connections, no_connections, fill = TRUE)
+    
+    return(all_group_connections)
+  }
+  
+  for (grp in unique(dt$group)) {
+    dt_group <- dt[group == grp]
+    group_connections <- calculate_group_connections(dt_group)
+    results[[grp]] <- group_connections
+  }
+  
+  all_connections <- rbindlist(results, use.names = TRUE, fill = TRUE)
+  Ak <- graph_from_data_frame(all_connections[!is.na(to_index)], directed = FALSE) %>% components()
+  membership_dt <- data.table(index = as.integer(names(Ak$membership)), homologues_membership = Ak$membership)
+  membership_dt[, homologues_membership := .N, by = homologues_membership]
+  
+  out <- merge(dt, membership_dt, by = "index", all.x = TRUE)
+  out[is.na(homologues_membership), homologues_membership := 1]
+  return(out)
+}
+
+formula_assignment_multi_intensity <- function(formulas, dataset, ppm_tolerance = 0.5, 
+                                               ion = 1.007825032 + -1 * 0.00054857990907, 
+                                               threshold = 1000, return_likeliest = TRUE,
+                                               homologues_network = list(
+                                                 CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
+                                                 H   = c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
+                                               )) {
+  dataset$m.z_ion <- dataset$m.z
+  dataset$m.z <- dataset$m.z + ion
+  
+  dataset[, `:=`(
+    lower_limit = m.z * (1 - ppm_tolerance / 1e6),
+    upper_limit = m.z * (1 + ppm_tolerance / 1e6)
+  )]
+  
+  formulas[, `:=`(start = calculated_m.z, end = calculated_m.z)]
+  
+  setkey(formulas, start, end)
+  setkey(dataset, lower_limit, upper_limit)
+  
+  all_matches <- foverlaps(formulas, dataset, 
+                           by.x = c("start", "end"), 
+                           by.y = c("lower_limit", "upper_limit"), 
+                           type = "within", nomatch = 0)
+  
+  dataset[, `:=`(lower_limit = NULL, upper_limit= NULL)]
+  
+  all_matches[, absolute_error := calculated_m.z - m.z]
+  all_matches[, ppm := (absolute_error / m.z) * 1e6]
+  
+  filtered_matches <- all_matches[, .(m.z_ion,m.z, calculated_m.z, absolute_error, ppm,
+                                      C, H, O, N, S, P , C_13, O_18, S_34)]
+  # Isotope peak verification
+  filtered_matches <- calculate_isotopes(filtered_matches, dataset = dataset)
+  
+  # Homologues series calculation
+  filtered_matches <- calculate_connections_panel5(filtered_matches, diffs = homologues_network)
+  filtered_matches[, index := NULL]
+  
+  # Create a boolean column that indicates if any isotope deviance is below threshold
+  filtered_matches[, isotope_below_threshold := (isotope_deviance_C_13_1 < threshold |
+                                                   isotope_deviance_C_13_2 < threshold |
+                                                   isotope_deviance_O_18 < threshold |
+                                                   isotope_deviance_S_34 < threshold)]
+  
+  if (return_likeliest) {
+    filtered_matches[, abs_ppm := abs(ppm)]
+    setorder(filtered_matches, m.z, -isotope_below_threshold, -homologues_membership, abs_ppm)
+    filtered_matches <- filtered_matches[, .SD[1], by = m.z]
+    filtered_matches[, abs_ppm := NULL]
+    filtered_matches[, homologues_membership := NULL]
+    
+    filtered_matches <- calculate_connections_panel5(filtered_matches, diffs = homologues_network)
+  }
+  
+  # Construct a molecular formula
+  construct_formula <- function(elements) {
+    formula_parts <- paste0(names(elements), ifelse(elements == 1, "", elements))
+    formula <- paste(formula_parts[elements > 0], collapse = "")
+    return(formula)
+  }
+  
+  filtered_matches[, MF := construct_formula(list(C = C, H = H, O = O, N = N, S = S, P = P)), by = 1:nrow(filtered_matches)]
+  
+  # Calculate AI.mod
+  filtered_matches[, AI_mod := (1 + C - 0.5 * O - S - 0.5 * (H + N + P )) / 
+                     ((C) - 0.5 * (O) - (S) - (N) - P)]
+  filtered_matches[, AI_mod := ifelse(AI_mod < 0 | is.infinite(AI_mod), 0, AI_mod)]
+  filtered_matches <- filtered_matches[AI_mod <= 1]
+  
+  filtered_matches[, NOSC := (-((4* (C) + (H) -3*(N) -2*(O) +5*P  -2* (S))/(C))+4)]
+  filtered_matches[, O.C := O/C]
+  filtered_matches[, H.C := H/C]
+  filtered_matches[, N.C := N/C]
+  filtered_matches[, S.C := S/C]
+  filtered_matches[, P.C := P/C]
+  
+  # Simple classification
+  filtered_matches[, class := fifelse(O.C > 0 & O.C <= 0.3 & H.C > 1.5 & H.C <= 2.5, "Lipid",
+                                      fifelse(O.C <= 0.125 & H.C >= 1 & H.C <= 1.5 & AI_mod > 0.5, "Unsaturated hydrocarbon",
+                                              fifelse(O.C > 0.3 & O.C <= 0.55 & H.C > 1.5 & H.C <= 2.3, "Protein",
+                                                      fifelse(O.C > 0.55 & O.C <= 0.7 & H.C > 1.5 & H.C <= 2.2, "Aminosugar",
+                                                              fifelse(O.C > 0.7 & O.C <= 1.05 & H.C > 1.5 & H.C <= 2.2, "Carbohydrate",
+                                                                      fifelse(AI_mod >= 0.67, "Condensed hydrocarbon",
+                                                                              fifelse(AI_mod < 0.67 & AI_mod > 0.5 & O.C > 0.125, "Aromatic",
+                                                                                      fifelse(O.C > 0.125 & AI_mod <= 0.5 & H.C <= 1.5, "Highly unsaturated", 
+                                                                                              "Unassigned"))))))))]
+  
+  filter_cols <- c("m.z_ion", "m.z","calculated_m.z", "absolute_error", "ppm","MF",  
+                   "group","class","C", "H", "O", "N", "S", "P" , "C_13", "O_18", "S_34", 
+                   "H.C", "O.C", "N.C", "S.C", "P.C","AI_mod", "NOSC","homologues_membership",
+                   "isotope_deviance_C_13_1","isotope_deviance_C_13_2","isotope_deviance_O_18","isotope_deviance_S_34",
+                   "isotope_below_threshold")
+  filtered_matches <-  filtered_matches[, ..filter_cols]
+  
+  dataset[, m.z := NULL]
+  filtered_matches <- merge(filtered_matches, dataset, by.x = "m.z_ion", by.y = "m.z_ion", all.x = TRUE)
+  
+  setorder(filtered_matches, m.z)
+  
+  return(filtered_matches)
+}
+
+# -- Panel 5 UI --
+panel5_ui <- fluidPage(
+  titlePanel("Formula Assignment and Isotope Calculation"),
+  sidebarLayout(
+    sidebarPanel(
+      numericInput("ppm_tolerance_panel5", "ppm tolerance:", value = 0.3, min = 0, step = 0.1),
+      numericInput("threshold_panel5", "Isotope deviance threshold:", value = 1000, min = 0, step = 1),
+      checkboxInput("return_likeliest_panel5", "Return Likeliest", value = TRUE),
+      checkboxGroupInput("homologues_network_panel5", "Select Homologues Network:", 
+                         choices = list(
+                           "CH2"  = "CH2",
+                           "CH2O" = "CH2O",
+                           "C2HO" = "C2HO",
+                           "CO2"  = "CO2",
+                           "H2O"  = "H2O",
+                           "H"    = "H",
+                           "O"    = "O",
+                           "NH3"  = "NH3"
+                         ),
+                         selected = c("CH2", "CH2O", "C2HO", "CO2", "H2O", "H", "O", "NH3")),
+      actionButton("calculate_panel5", "Calculate (Panel 5)"),
+      textOutput("status_panel5")
+    ),
+    mainPanel(
+      DT::dataTableOutput("summary_panel5")
+    )
+  )
+)
+
+# -- Panel 5 Server --
+panel5_server <- function(input, output, session) {
+  
+  crosstab_water_unambigous <- reactiveVal(NULL)
+  
+  observeEvent(input$calculate_panel5, {
+    output$status_panel5 <- renderText("Calculating...")
+    
+    # Ensure we have 'formulas' and 'merged_samples' in global environment
+    if (!exists("formulas", envir = .GlobalEnv)) {
+      output$status_panel5 <- renderText("Error: 'formulas' is not found in the global environment.")
+      return(NULL)
+    }
+    if (!exists("merged_samples", envir = .GlobalEnv)) {
+      output$status_panel5 <- renderText("Error: 'merged_samples' is not found in the global environment.")
+      return(NULL)
+    }
+    
+    local_formulas <- get("formulas", envir = .GlobalEnv)
+    local_water_dt <- get("merged_samples", envir = .GlobalEnv)
+    
+    tryCatch({
+      selected_homologues <- list()
+      if ("CH2"  %in% input$homologues_network_panel5) selected_homologues$CH2  <- c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0)
+      if ("CH2O" %in% input$homologues_network_panel5) selected_homologues$CH2O <- c(C = 1, H = 2, O = 1, N = 0, S = 0, P = 0)
+      if ("C2HO" %in% input$homologues_network_panel5) selected_homologues$C2HO <- c(C = 2, H = 1, O = 1, N = 0, S = 0, P = 0)
+      if ("CO2"  %in% input$homologues_network_panel5) selected_homologues$CO2  <- c(C = 1, H = 0, O = 2, N = 0, S = 0, P = 0)
+      if ("H2O"  %in% input$homologues_network_panel5) selected_homologues$H2O  <- c(C = 0, H = 2, O = 1, N = 0, S = 0, P = 0)
+      if ("H"    %in% input$homologues_network_panel5) selected_homologues$H    <- c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
+      if ("O"    %in% input$homologues_network_panel5) selected_homologues$O    <- c(C = 0, H = 0, O = 1, N = 0, S = 0, P = 0)
+      if ("NH3"  %in% input$homologues_network_panel5) selected_homologues$NH3  <- c(C = 0, H = 3, O = 0, N = 1, S = 0, P = 0)
+      
+      result <- formula_assignment_multi_intensity(
+        formulas          = local_formulas,
+        dataset           = local_water_dt,
+        ppm_tolerance     = input$ppm_tolerance_panel5,
+        threshold         = input$threshold_panel5,
+        return_likeliest  = input$return_likeliest_panel5,
+        homologues_network= selected_homologues
+      )
+      
+      crosstab_water_unambigous(result)
+      assign("crosstab_water_unambigous", result, envir = .GlobalEnv)
+      output$status_panel5 <- renderText("Calculation finished. 'crosstab_water_unambigous' assigned to global environment.")
+    }, error = function(e) {
+      output$status_panel5 <- renderText(paste("Error:", e$message))
+    })
+  })
+  
+  output$summary_panel5 <- DT::renderDataTable({
+    head(crosstab_water_unambigous(), 10)
+  }, options = list(pageLength = 10))
+}
+
+###############################################################################
+#                             COMBINED UI & SERVER                             #
+###############################################################################
+
+# Combine all panel UIs into one "navbarPage".
+# Then define one server that calls each panel’s server function within its own scope.
+
+ui <- navbarPage(
+  title = "Merged Shiny App",
+  
+  tabPanel(
+    "MDL",
+    panel1_ui
+  ),
+  
+  tabPanel(
+    "Formula Template",
+    panel2_ui
+  ),
+  
+  tabPanel(
+    "Recalibration",
+    panel3_ui
+  ),
+  
+  tabPanel(
+    "Sample Merging",
+    panel4_ui
+  ),
+  
+  tabPanel(
+    "Formula Assignment",
+    panel5_ui
+  )
+)
+
+# A single server function that calls each panel's server logic
+server <- function(input, output, session) {
+  callModule(module = panel1_server, id = NULL)
+  callModule(module = panel2_server, id = NULL)
+  callModule(module = panel3_server, id = NULL)
+  callModule(module = panel4_server, id = NULL)
+  callModule(module = panel5_server, id = NULL)
+}
+
+# Launch the unified Shiny app
+shinyApp(ui, server)
