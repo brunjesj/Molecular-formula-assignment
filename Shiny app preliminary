@@ -499,8 +499,8 @@ panel3_ui <- fluidPage(
   titlePanel("MZ Recalibration Tool"),
   sidebarLayout(
     sidebarPanel(
-      numericInput("ppm_tolerance", "ppm tolerance:", value = 0.5, min = 0, step = 0.1),
-      numericInput("S_MDL_limit", "S/MDL lower limit:", value = 1.5, min = 0, step = 0.1),
+      numericInput("ppm_tolerance", "ppm tolerance:", value = 0.2, min = 0, step = 0.05),
+      numericInput("S_MDL_limit", "S/MDL lower limit:", value = 2, min = 0, step = 0.1),
       numericInput("hom_member_min", "Homologue network length min:", value = 1, min = 1, step = 1),
       actionButton("calculate_mz", "Calculate (Panel 3)"),
       actionButton("prev", "Previous Sample"),
@@ -610,7 +610,7 @@ panel4_ui <- fluidPage(
   titlePanel("Merge m/z Values"),
   sidebarLayout(
     sidebarPanel(
-      numericInput("ppm_tolerance_merge", "PPM Tolerance:", value = 0.6, min = 0, step = 0.1),
+      numericInput("ppm_tolerance_merge", "PPM Tolerance:", value = 0.5, min = 0, step = 0.1),
       actionButton("calculate_merge", "Calculate (Panel 4)")
     ),
     mainPanel(
@@ -912,6 +912,7 @@ calculate_connections_panel5 <- function(dt,
 formula_assignment_multi_intensity <- function(formulas, dataset, ppm_tolerance = 0.5, 
                                                ion = 1.007825032 + -1 * 0.00054857990907, 
                                                threshold = 1000, return_likeliest = TRUE,
+                                               delete_singlets = T, delete_MF_without_connection = T,
                                                homologues_network = list(
                                                  CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
                                                  H   = c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
@@ -961,6 +962,10 @@ formula_assignment_multi_intensity <- function(formulas, dataset, ppm_tolerance 
     filtered_matches[, abs_ppm := NULL]
     filtered_matches[, homologues_membership := NULL]
     
+    filtered_matches <- subset(filtered_matches, (filtered_matches$C_13 ==0 | filtered_matches$isotope_below_threshold == T) &
+                     (filtered_matches$O_18 ==0 | filtered_matches$isotope_below_threshold == T) &
+                     (filtered_matches$S_34 ==0 | filtered_matches$isotope_below_threshold == T) )
+    
     filtered_matches <- calculate_connections_panel5(filtered_matches, diffs = homologues_network)
   }
   
@@ -1007,6 +1012,30 @@ formula_assignment_multi_intensity <- function(formulas, dataset, ppm_tolerance 
   dataset[, m.z := NULL]
   filtered_matches <- merge(filtered_matches, dataset, by.x = "m.z_ion", by.y = "m.z_ion", all.x = TRUE)
   
+  #create a present_in column and move it right before sample intensities
+  filtered_matches[, present_in := rowSums(!is.na(.SD)), .SDcols = 33:ncol(filtered_matches)]
+  setcolorder(filtered_matches, c(names(filtered_matches)[1:32], "present_in", setdiff(names(filtered_matches), c(names(filtered_matches)[1:32], "present_in"))))
+  #furhter data filtering
+  if (delete_singlets){
+    filtered_matches <- subset(filtered_matches, present_in >1)
+  }
+  if (delete_MF_without_connection){
+   
+    #recalculate homseries
+    if (delete_singlets){
+      # Homologues series recalculation after deletion of singlets
+      temp <- filtered_matches
+      temp[, homologues_membership := NULL]
+      
+      filtered_matches$homologues_membership <- calculate_connections_panel5(temp, diffs = homologues_network)$homologues_membership
+      filtered_matches[, index := NULL]
+      setcolorder(filtered_matches, c(names(filtered_matches)[1:32], "homologues_membership", setdiff(names(filtered_matches), c(names(filtered_matches)[1:32], "homologues_membership"))))
+      
+    }
+    filtered_matches <- subset(filtered_matches, homologues_membership >1)
+
+  }
+  
   setorder(filtered_matches, m.z)
   
   return(filtered_matches)
@@ -1020,6 +1049,8 @@ panel5_ui <- fluidPage(
       numericInput("ppm_tolerance_panel5", "ppm tolerance:", value = 0.3, min = 0, step = 0.1),
       numericInput("threshold_panel5", "Isotope deviance threshold:", value = 1000, min = 0, step = 1),
       checkboxInput("return_likeliest_panel5", "Return Likeliest", value = TRUE),
+      checkboxInput("delete_singlets", "Delete Singlets", value = TRUE),
+      checkboxInput("delete_MF_without_connection", "Delete MF without Connection", value = TRUE),
       checkboxGroupInput("homologues_network_panel5", "Select Homologues Network:", 
                          choices = list(
                            "CH2"  = "CH2",
@@ -1031,12 +1062,12 @@ panel5_ui <- fluidPage(
                            "O"    = "O",
                            "NH3"  = "NH3"
                          ),
-                         selected = c("CH2", "CH2O", "C2HO", "CO2", "H2O", "H", "O", "NH3")),
+                         selected = c("CH2",  "O")),
       actionButton("calculate_panel5", "Calculate (Panel 5)"),
       textOutput("status_panel5")
     ),
     mainPanel(
-      DT::dataTableOutput("summary_panel5")
+      DTOutput("results_table_panel_5")
     )
   )
 )
@@ -1044,7 +1075,7 @@ panel5_ui <- fluidPage(
 # -- Panel 5 Server --
 panel5_server <- function(input, output, session) {
   
-  crosstab_water_unambigous <- reactiveVal(NULL)
+  crosstab <- reactiveVal(NULL)
   
   observeEvent(input$calculate_panel5, {
     output$status_panel5 <- renderText("Calculating...")
@@ -1079,21 +1110,25 @@ panel5_server <- function(input, output, session) {
         ppm_tolerance     = input$ppm_tolerance_panel5,
         threshold         = input$threshold_panel5,
         return_likeliest  = input$return_likeliest_panel5,
-        homologues_network= selected_homologues
+        homologues_network= selected_homologues,
+        delete_singlets   = input$delete_singlets,
+        delete_MF_without_connection = input$delete_MF_without_connection
       )
       
-      crosstab_water_unambigous(result)
-      assign("crosstab_water_unambigous", result, envir = .GlobalEnv)
-      output$status_panel5 <- renderText("Calculation finished. 'crosstab_water_unambigous' assigned to global environment.")
+      crosstab(result)
+      
+      assign("crosstab", result, envir = .GlobalEnv)
+      output$status_panel5 <- renderText("Calculation finished. 'crosstab' assigned to global environment.")
     }, error = function(e) {
       output$status_panel5 <- renderText(paste("Error:", e$message))
     })
   })
   
-  output$summary_panel5 <- DT::renderDataTable({
-    head(crosstab_water_unambigous(), 10)
-  }, options = list(pageLength = 10))
+  output$results_table_panel_5 <- renderDT({
+    crosstab()
+  })
 }
+
 
 ###############################################################################
 #                             COMBINED UI & SERVER                             #
@@ -1142,3 +1177,4 @@ server <- function(input, output, session) {
 
 # Launch the unified Shiny app
 shinyApp(ui, server)
+
