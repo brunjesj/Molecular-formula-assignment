@@ -42,15 +42,16 @@ process_samples_MDL <- function(sample, sample_name, MDL_master) {
   setnames(sample, "m/z", "m.z", skip_absent = TRUE)
   sample[, nominal_mz := floor(m.z + 0.5)]
   merged_data <- merge(sample, MDL_master, by.x = "nominal_mz", by.y = "m.z", all.x = TRUE)
-  data <- merged_data[I >= MDL, .(
+  merged_data <- merged_data[I >= MDL, .(
     m.z = m.z, 
     I = I, 
-    MDL = MDL, 
+    MDL = round(MDL), 
     ResPow = Res., 
     index = sample_name
   )]
-  data <- ResPow_outlier(data)
-  return(data)
+  merged_data <- ResPow_outlier(merged_data)
+  gc()
+  return(merged_data)
 }
 
 # -- Panel 1 UI --
@@ -64,12 +65,11 @@ panel1_ui <- fluidPage(
       fileInput("samples_files", "Select sample files:", 
                 multiple = TRUE, accept = c(".csv")),
       numericInput("confidence_level", "Confidence Level:", value = 0.998, min = 0, max = 1, step = 0.001),
-      actionButton("calculate", "Calculate (Panel 1)")
+      actionButton("calculate", "Calculate")
     ),
     
     mainPanel(
       verbatimTextOutput("status"),
-      tableOutput("results"),
       tableOutput("overview")
     )
   )
@@ -92,6 +92,7 @@ panel1_server <- function(input, output, session) {
   
   samples_MDL <- eventReactive(input$calculate, {
     req(blanks_data(), samples_data())
+    notification_id <- showNotification("Calculating...", type = "message", duration = NULL)
     
     blank_list <- blanks_data()
     sample_list <- samples_data()
@@ -103,14 +104,18 @@ panel1_server <- function(input, output, session) {
       blank[, .(
         MDL = qt(input$confidence_level, df = .N - 1) * sd(I) + mean(I)
       ), by = nominal_mass]
-    })
+    }) %>% rbindlist()
     
-    MDL_master <- rbindlist(MDL_master)
     MDL_master <- MDL_master[, .(MDL = mean(MDL), sd = sd(MDL)), by = nominal_mass]
     setnames(MDL_master, "nominal_mass", "m.z")
     
+    # Initialize progress bar
+    progress <- Progress$new(session, min = 0, max = length(sample_list))
+    on.exit(progress$close())
+    
     # Process samples
     processed_samples <- lapply(seq_along(sample_list), function(i) {
+      progress$set(value = i, message = "Processing samples", detail = paste0("Sample ", i, " of ", length(sample_list)))
       sample <- sample_list[[i]]
       process_samples_MDL(sample, names(sample_list)[i], MDL_master)
     })
@@ -119,6 +124,7 @@ panel1_server <- function(input, output, session) {
     
     # Export processed_samples to the global environment
     assign("samples_MDL", processed_samples, envir = .GlobalEnv)
+    removeNotification(notification_id)
     
     processed_samples
   })
@@ -141,12 +147,7 @@ panel1_server <- function(input, output, session) {
   
   output$status <- renderPrint({
     req(samples_MDL())
-    paste("Processing complete. Processed", length(samples_MDL()), "samples.")
-  })
-  
-  output$results <- renderTable({
-    req(samples_data())
-    head(samples_data()[[1]]) # Display the first few rows of the first sample
+    paste("Processing complete. Samples available in local environment", length(samples_MDL()), "samples.")
   })
   
   output$overview <- renderTable({
@@ -154,6 +155,7 @@ panel1_server <- function(input, output, session) {
     overview_data()
   })
 }
+
 
 ###############################################################################
 #               Panel 2:  Functions & Shiny UI/Server Code                    #
@@ -239,7 +241,8 @@ generate_formulas <- function(C_range, H_range, O_range, N_range, S_range, P_ran
   results <- results[, .(C, H, O, N, S, P, C_13, O_18, S_34, calculated_m.z = mz)]
   results[is.na(results)] <- 0
   setorder(results, calculated_m.z)
-  results
+  gc()
+  return(results)
 }
 
 # -- Panel 2 UI --
@@ -257,7 +260,7 @@ panel2_ui <- fluidPage(
       sliderInput("HC", "H/C Range:", min = 0, max = 5, value = c(0.2, 3), step = 0.1),
       sliderInput("OC", "O/C Range:", min = 0, max = 4, value = c(0, 1.2), step = 0.1),
       checkboxInput("insert_isotopes", "Insert Isotopes", value = TRUE),
-      actionButton("calc_button", "Calculate Formulas (Panel 2)")
+      actionButton("calc_button", "Calculate Formulas")
     ),
     mainPanel(
       DTOutput("results_table"),
@@ -270,7 +273,10 @@ panel2_ui <- fluidPage(
 panel2_server <- function(input, output, session) {
   
   results <- eventReactive(input$calc_button, {
-    generate_formulas(
+    notification_id <- showNotification("Calculating...", type = "message", duration = NULL)
+    
+    
+    out <- generate_formulas(
       C_range = input$C_range[1]:input$C_range[2],
       H_range = input$H_range[1]:input$H_range[2],
       O_range = input$O_range[1]:input$O_range[2],
@@ -282,10 +288,13 @@ panel2_server <- function(input, output, session) {
       OC = input$OC,
       insert_isotopes = input$insert_isotopes
     )
+    removeNotification(notification_id)
+    
+    out
   })
   
   output$results_table <- renderDT({
-    results()
+    head(results())
   })
   
   observeEvent(input$calc_button, {
@@ -329,7 +338,7 @@ formula_assignment <- function(formulas, dataset, ppm_tolerance = 0.5,
   
   unique_mz <- filtered_matches[, .N, by = m.z][N == 1, m.z]
   filtered_matches <- filtered_matches[m.z %in% unique_mz]
-  
+  gc()
   filtered_matches
 }
 
@@ -405,7 +414,7 @@ calculate_connections <- function(dt, diffs = list(
   membership_dt[, homologues_membership := .N, by = homologues_membership]
   out <- merge(dt, membership_dt, by = "index", all.x = TRUE)
   out[is.na(homologues_membership), homologues_membership := 1]
-  
+  gc()
   return(out)
 }
 
@@ -491,6 +500,7 @@ mz_recalibration <- function(formulas, dataset, ppm_tolerance = 0.5,
   }
   
   print(paste0("Finished ", dataset$index[1]))
+  gc()
   return(list(data = dataset, plot = plot))
 }
 
@@ -499,12 +509,12 @@ panel3_ui <- fluidPage(
   titlePanel("MZ Recalibration Tool"),
   sidebarLayout(
     sidebarPanel(
-      numericInput("ppm_tolerance", "ppm tolerance:", value = 0.2, min = 0, step = 0.05),
+      numericInput("ppm_tolerance", "ppm tolerance:", value = 0.5, min = 0, step = 0.05),
       numericInput("S_MDL_limit", "S/MDL lower limit:", value = 2, min = 0, step = 0.1),
-      numericInput("hom_member_min", "Homologue network length min:", value = 1, min = 1, step = 1),
-      actionButton("calculate_mz", "Calculate (Panel 3)"),
-      actionButton("prev", "Previous Sample"),
-      actionButton("next_sample", "Next Sample")
+      numericInput("hom_member_min", "Homologue network length min:", value = 2, min = 1, step = 1),
+      actionButton("calculate_mz", "Recalibrate"),
+      # Removed the Previous/Next buttons; add a dynamic UI for the sample slider
+      uiOutput("sample_slider_ui")
     ),
     mainPanel(
       tabsetPanel(
@@ -519,7 +529,6 @@ panel3_server <- function(input, output, session) {
   
   # We'll store the list of recalibration results here
   recal_data <- reactiveVal(NULL)
-  current_sample <- reactiveVal(1)
   
   # Event to trigger recalibration of all "samples_MDL" with "formulas"
   observeEvent(input$calculate_mz, {
@@ -534,12 +543,19 @@ panel3_server <- function(input, output, session) {
       return(NULL)
     }
     
+    notification_id <- showNotification("Calculating...", type = "message", duration = NULL)
+    
     local_samples <- get("samples_MDL", envir = .GlobalEnv)
     local_formulas <- get("formulas", envir = .GlobalEnv)
     
+    # Initialize progress bar
+    progress <- Progress$new(session, min = 0, max = length(local_samples))
+    on.exit(progress$close())
+    
     # Recalibration
-    out_list <- lapply(local_samples, function(dataset) {
-      mz_recalibration(local_formulas, dataset,
+    out_list <- lapply(seq_along(local_samples), function(i) {
+      progress$set(value = i, message = "Processing samples", detail = paste0("Sample ", i, " of ", length(local_samples)))
+      mz_recalibration(subset(local_formulas, S == 0 & P == 0), local_samples[[i]],
                        ppm_tolerance = input$ppm_tolerance,
                        S_MDL_limit = input$S_MDL_limit,
                        hom_member_min = input$hom_member_min,
@@ -552,23 +568,33 @@ panel3_server <- function(input, output, session) {
     # Extract the data portion and assign to the global environment
     data_only_list <- lapply(out_list, function(x) x$data)
     assign("samples_MDL_recal_data", data_only_list, envir = .GlobalEnv)
+    removeNotification(notification_id)
     showNotification("MZ Recalibration complete! 'samples_MDL_recal_data' saved globally.", type = "message")
-    
-    current_sample(1)
   })
   
-  # Navigation for the plot
-  observeEvent(input$next_sample, {
+  # Dynamically generate the sample slider once recal_data() is available
+  output$sample_slider_ui <- renderUI({
     req(recal_data())
-    current_sample(min(current_sample() + 1, length(recal_data())))
+    sliderInput(
+      "sample_slider",
+      "Select Sample:",
+      min = 1,
+      max = length(recal_data()),
+      value = 1,
+      step = 1
+    )
   })
   
-  observeEvent(input$prev, {
+  # Reactive value for the current sample index
+  current_sample <- reactiveVal(1)
+  
+  # Update current sample whenever the slider value changes
+  observeEvent(input$sample_slider, {
     req(recal_data())
-    current_sample(max(current_sample() - 1, 1))
+    current_sample(input$sample_slider)
   })
   
-  # Render Plot for the current sample
+  # Render the plot for the currently selected sample
   output$mz_plot <- renderPlotly({
     req(recal_data())
     idx <- current_sample()
@@ -577,6 +603,8 @@ panel3_server <- function(input, output, session) {
     }
   })
 }
+
+
 
 ###############################################################################
 #               Panel 4:  Functions & Shiny UI/Server Code                    #
@@ -602,6 +630,7 @@ merge_mz_values <- function(dt, ppm_tolerance) {
   dt2 <- dt[, .SD[1], by = .(group, index)]
   dt_wide <- dcast(dt2, merged_mz + mean_MDL + SE ~ index, value.var = "I", fill = NA)
   colnames(dt_wide)[c(1, 2)] <- c("m.z", "MDL")
+  gc()
   return(dt_wide)
 }
 
@@ -611,10 +640,11 @@ panel4_ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       numericInput("ppm_tolerance_merge", "PPM Tolerance:", value = 0.5, min = 0, step = 0.1),
-      actionButton("calculate_merge", "Calculate (Panel 4)")
+      actionButton("calculate_merge", "Merge samples")
     ),
     mainPanel(
-      verbatimTextOutput("status_merge")
+      verbatimTextOutput("status_merge"),
+      DTOutput("results_table_merge")
     )
   )
 )
@@ -631,6 +661,8 @@ panel4_server <- function(input, output, session) {
     
     # Perform the calculation
     output$status_merge <- renderText("Calculating...")
+    notification_id <- showNotification("Calculating...", type = "message", duration = NULL)
+    
     
     tryCatch({
       local_samples <- get("samples_MDL_recal_data", envir = .GlobalEnv)
@@ -639,11 +671,15 @@ panel4_server <- function(input, output, session) {
       
       # Assign result to global environment
       assign("merged_samples", result_dt, envir = .GlobalEnv)
-      
+      removeNotification(notification_id)
       output$status_merge <- renderText("Calculation complete! Check the global environment for 'merged_samples'.")
     }, error = function(e) {
       output$status_merge <- renderText(paste("Error:", e$message))
     })
+    output$results_table_merge <- renderDT({
+      head(result_dt)
+    })
+    
   })
 }
 
@@ -829,6 +865,7 @@ calculate_isotopes <- function(filtered_matches, dataset){
   
   # final <- merge(isotopes, parents, 
   #                            by = colnames(isotopes), all = T)
+  gc()
   out <- rbind(parent_all, isotopes, fill =T)
 }
 
@@ -906,6 +943,7 @@ calculate_connections_panel5 <- function(dt,
   
   out <- merge(dt, membership_dt, by = "index", all.x = TRUE)
   out[is.na(homologues_membership), homologues_membership := 1]
+  gc()
   return(out)
 }
 
@@ -1037,7 +1075,7 @@ formula_assignment_multi_intensity <- function(formulas, dataset, ppm_tolerance 
   }
   
   setorder(filtered_matches, m.z)
-  
+  gc()
   return(filtered_matches)
 }
 
@@ -1063,7 +1101,7 @@ panel5_ui <- fluidPage(
                            "NH3"  = "NH3"
                          ),
                          selected = c("CH2",  "O")),
-      actionButton("calculate_panel5", "Calculate (Panel 5)"),
+      actionButton("calculate_panel5", "Assign Formulas"),
       textOutput("status_panel5")
     ),
     mainPanel(
@@ -1104,6 +1142,8 @@ panel5_server <- function(input, output, session) {
       if ("O"    %in% input$homologues_network_panel5) selected_homologues$O    <- c(C = 0, H = 0, O = 1, N = 0, S = 0, P = 0)
       if ("NH3"  %in% input$homologues_network_panel5) selected_homologues$NH3  <- c(C = 0, H = 3, O = 0, N = 1, S = 0, P = 0)
       
+      notification_id <- showNotification("Calculating...", type = "message", duration = NULL)
+      
       result <- formula_assignment_multi_intensity(
         formulas          = local_formulas,
         dataset           = local_water_dt,
@@ -1118,7 +1158,8 @@ panel5_server <- function(input, output, session) {
       crosstab(result)
       
       assign("crosstab", result, envir = .GlobalEnv)
-      output$status_panel5 <- renderText("Calculation finished. 'crosstab' assigned to global environment.")
+      output$status_panel5 <- renderText("Calculation complete. Results saved to 'crosstab' in your R environment.")
+      removeNotification(notification_id)
     }, error = function(e) {
       output$status_panel5 <- renderText(paste("Error:", e$message))
     })
@@ -1138,7 +1179,7 @@ panel5_server <- function(input, output, session) {
 # Then define one server that calls each panel’s server function within its own scope.
 
 ui <- navbarPage(
-  title = "Merged Shiny App",
+  title = "Formula Asssigner",
   
   tabPanel(
     "MDL",
@@ -1178,3 +1219,21 @@ server <- function(input, output, session) {
 # Launch the unified Shiny app
 shinyApp(ui, server)
 
+
+# 
+# #data processing
+# sub <- crosstab
+# #sub[, present_in := rowSums(!is.na(.SD)), .SDcols = 33:77]
+# sub[, present_in_percent := (present_in / 45) * 100]
+# sub1 <- subset(sub, sub$homologues_membership >4 & sub$present_in >1)
+# #sub1 <- subset(sub1, sub1$`masslistsESI_neg_Nelha_25ppm_200scans_0-1acc_mid_20200812_000001` >0)
+# plot <- vk_plot_hist(list(sub1))#, sizes = list(sqrt(sub1$present_in_percent)))
+# plot
+# 
+# plot_mass_spectrum(dat = list(as.data.frame(sub1)), intensity_colum = 33, norm = F)
+
+
+
+#reduce overhead: button to remove original files after mdl calculation?
+#rewrite recalibration function to not use lapply and instead only data.table syntax.
+#try to remove lapply where possible to remove overhead
