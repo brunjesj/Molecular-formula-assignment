@@ -46,12 +46,15 @@ ResPow_outlier <- function(dataset) {
   
   # Return only rows whose residuals are within ±e
   dataset[d$residuals <= abs(e)]
+  
+  dataset[, ResPow := NULL]
+  
 }
 
 # Function to process samples and remove peaks below MDL
-process_samples_MDL <- function(sample, sample_name, MDL_master) {
+process_samples_MDL <- function(sample, MDL_master) {
   #0. change integer 64 into numeric for intensity
-  sample[, I := round(as.numeric(I), -4)]
+  sample[, I := as.numeric(I)]
   
   # 1. Rename columns in place
   setnames(sample, old = "m/z", new = "m.z", skip_absent = TRUE)
@@ -66,11 +69,12 @@ process_samples_MDL <- function(sample, sample_name, MDL_master) {
     sample, MDL_master, by.x = "nominal_mz", by.y = "m.z", all.x = TRUE
   )[
     I >= MDL,
-    .(m.z, I, MDL, ResPow = Res., index = sample_name)
+    .(m.z, I, MDL, ResPow = Res.)
   ] |>
     ResPow_outlier()
 }
 
+# -- Panel 1 UI --
 # -- Panel 1 UI --
 panel1_ui <- fluidPage(
   titlePanel("Instrument Blanks Noise Removal"),
@@ -81,8 +85,33 @@ panel1_ui <- fluidPage(
                 multiple = TRUE, accept = c(".csv")),
       fileInput("samples_files", "Select sample files:", 
                 multiple = TRUE, accept = c(".csv")),
-      numericInput("confidence_level", "Confidence Level:", value = 0.998, min = 0, max = 1, step = 0.001),
-      actionButton("calculate", "Calculate")
+      
+      # Radio buttons to select the approach
+      radioButtons(
+        inputId = "approach", 
+        label = "Select MDL calculation approach:",
+        choices = c("Riedel 2014 approach", "Merder 2020 approach")
+      ),
+      
+      # Conditional panel for inputs relevant only to Riedel 2014 approach
+      conditionalPanel(
+        condition = "input.approach == 'Riedel 2014 approach'",
+        numericInput("confidence_level_riedel", 
+                     "Confidence Level (Riedel):", 
+                     value = 0.998, min = 0, max = 1, step = 0.001)
+      ),
+      
+      # Conditional panel for inputs relevant only to Merder 2020 approach
+      conditionalPanel(
+        condition = "input.approach == 'Merder 2020 approach'",
+        numericInput("MDL_level_Merder", 
+                     "MDL_level:", 
+                     value = 2.5, min = 1, step = 0.1)
+      ),
+      
+      actionButton("calculate", "Calculate", class = "btn-lg btn-success"),
+      downloadButton("download_MDL", "Download as .rds")  ,
+      
     ),
     
     mainPanel(
@@ -114,18 +143,53 @@ panel1_server <- function(input, output, session) {
     blank_list <- blanks_data()
     sample_list <- samples_data()
     
-    # Compute MDL_master
+    
+    # Step 1: Compute MDL_master based on user-selected approach
     MDL_master <- lapply(blank_list, function(blank) {
       colnames(blank)[1] <- "m.z"
       blank[, nominal_mass := floor(m.z + 0.5)]
-      blank[, .(
-        MDL = qt(input$confidence_level, df = .N - 1) * sd(I) + mean(I)
-      ), by = nominal_mass]
+      if (input$approach == "Riedel 2014 approach") {
+        # Use Riedel-based formula (t-statistic with user-defined confidence level)
+        blank[, .(
+          MDL = qt(input$confidence_level_riedel, df = .N - 1) * sd(I) + mean(I)
+        ), by = nominal_mass]
+      } else {
+        # Use Merder 2020 approach
+
+
+
+          
+          sd_I <- sd(blank$I, na.rm = TRUE)
+          mean_I <- mean(blank$I, na.rm = TRUE)
+          blank[, z_score_I := (I - mean_I) / sd_I]
+          
+
+          
+          blank[, MDL_z_score := mean(z_score_I, na.rm = TRUE) + 
+                  input$MDL_level_Merder * sd(z_score_I, na.rm = TRUE), 
+                by = nominal_mass]
+          # Fit a GAM model
+          gam_model <- gam(MDL_z_score ~ s(m.z, bs = "cs", k = 4), data = blank)
+
+          unique_nominal_mz <- unique(blank[, .(nominal_mass)])
+          setnames(unique_nominal_mz, 1, "m.z")
+          
+          unique_nominal_mz<- unique_nominal_mz[, MDL := predict(gam_model, newdata = .SD)* sd_I + mean_I]
+ 
+          colnames(unique_nominal_mz)[1] <- "nominal_mass"
+          unique_nominal_mz
+        
+
+        
+        
+        
+        
+      }
     }) %>% rbindlist()
-    
+
     MDL_master <- MDL_master[, .(MDL = round(mean(MDL))), by = nominal_mass]
     setnames(MDL_master, "nominal_mass", "m.z")
-    
+
     # Initialize progress bar
     progress <- Progress$new(session, min = 0, max = length(sample_list))
     on.exit(progress$close())
@@ -137,7 +201,6 @@ panel1_server <- function(input, output, session) {
       sample <- sample_list[[i]]
       process_samples_MDL(
         sample      = sample_list[[i]], 
-        sample_name = names(sample_list)[i], 
         MDL_master  = MDL_master
       )
       
@@ -149,6 +212,16 @@ panel1_server <- function(input, output, session) {
     assign("samples_MDL", processed_samples, envir = .GlobalEnv)
     removeNotification(notification_id)
     gc ()
+    
+    output$download_MDL<- downloadHandler(
+      filename = function() {
+        paste("Noise_cleaned_samples", Sys.Date(), ".rds", sep = "")
+      },
+      content = function(file) {
+        saveRDS(processed_samples, file)
+      }
+    )
+    
     processed_samples
   })
   
@@ -330,6 +403,7 @@ panel2_ui <- fluidPage(
   titlePanel("Molecular Formula Generator"),
   sidebarLayout(
     sidebarPanel(
+      actionButton("calc_button", "Calculate Formulas", class = "btn-lg btn-success"),
       sliderInput("C_range", "C Range:", min = 1, max = 100, value = c(1, 50)),
       sliderInput("H_range", "H Range:", min = 1, max = 200, value = c(2, 120)),
       sliderInput("O_range", "O Range:", min = 0, max = 100, value = c(0, 50)),
@@ -340,7 +414,8 @@ panel2_ui <- fluidPage(
       sliderInput("HC", "H/C Range:", min = 0, max = 5, value = c(0.2, 3), step = 0.1),
       sliderInput("OC", "O/C Range:", min = 0, max = 4, value = c(0, 1.2), step = 0.1),
       checkboxInput("insert_isotopes", "Insert Isotopes", value = TRUE),
-      actionButton("calc_button", "Calculate Formulas")
+
+      downloadButton("download_csv_formulas", "Download CSV")  
     ),
     mainPanel(
       DTOutput("results_table"),
@@ -355,7 +430,6 @@ panel2_server <- function(input, output, session) {
   results <- eventReactive(input$calc_button, {
     notification_id <- showNotification("Calculating...", type = "message", duration = NULL)
     
-    
     out <- generate_formulas(
       C_range = input$C_range[1]:input$C_range[2],
       H_range = input$H_range[1]:input$H_range[2],
@@ -369,7 +443,15 @@ panel2_server <- function(input, output, session) {
       insert_isotopes = input$insert_isotopes
     )
     removeNotification(notification_id)
-    
+    # Download handler for CSV file
+    output$download_csv_formulas <- downloadHandler(
+      filename = function() {
+        paste("molecular_formulas", Sys.Date(), ".csv", sep = "")
+      },
+      content = function(file) {
+        fwrite(out, file)
+      }
+    )
     out
   })
   
@@ -378,210 +460,146 @@ panel2_server <- function(input, output, session) {
   })
   
   observeEvent(input$calc_button, {
-    assign("formulas", results(), envir = .GlobalEnv)
+    assign("molecular_formulas", results(), envir = .GlobalEnv)
     output$calc_message <- renderText({
       "Calculation complete. Results saved to 'formulas' in your R environment."
     })
   })
+  
+  
 }
+
 
 ###############################################################################
 #               Panel 3:  Functions & Shiny UI/Server Code                    #
 #                      (MZ Recalibration Tool)                                #
 ###############################################################################
 
+#still performs poorly in areas outside of calibration.
+
 # -- Panel 3 Functions --
-formula_assignment <- function(formulas, dataset, ppm_tolerance = 0.5, 
-                               ion = 1.007825032 + -1 * 0.00054857990907) {
-  dataset$m.z_ion <- dataset$m.z
-  dataset$m.z <- dataset$m.z + ion
-  
-  dataset[, `:=`(
-    lower_limit = m.z * (1 - ppm_tolerance / 1e6),
-    upper_limit = m.z * (1 + ppm_tolerance / 1e6)
-  )]
-  
-  formulas[, `:=`(start = calculated_m.z, end = calculated_m.z)]
-  
-  setkey(formulas, start, end)
-  setkey(dataset, lower_limit, upper_limit)
-  final_matches <- foverlaps(formulas, dataset, 
-                             by.x = c("start", "end"), 
-                             by.y = c("lower_limit", "upper_limit"), 
-                             type = "within", nomatch = 0)
-  
-  final_matches[, absolute_error := calculated_m.z - m.z]
-  final_matches[, ppm := (absolute_error / m.z) * 1e6]
-  
-  filtered_matches <- final_matches[, .(m.z_ion, m.z, calculated_m.z, absolute_error, ppm,
-                                        C, H, O, N, S, P , C_13, O_18, S_34, I, MDL)]
-  
-  unique_mz <- filtered_matches[, .N, by = m.z][N == 1, m.z]
-  filtered_matches <- filtered_matches[m.z %in% unique_mz]
-  gc()
-  filtered_matches
-}
 
-calculate_connections <- function(dt, diffs = list(
-  CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
-  H   = c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
-)) {
-  setorder(dt, C, H, O)
-  dt[, index := .I]
-  dt[, group := fifelse(N > 0 & P > 0, "NP", 
-                        fifelse(N > 0 & (S > 0 | S_34 > 0), "NS", 
-                                fifelse((S > 0 | S_34 > 0) & P > 0, "SP", 
-                                        fifelse(N > 0 & S == 0 & P == 0 & S_34 == 0, "N", 
-                                                fifelse((S > 0 | S_34 > 0) & N == 0 & P == 0, "S", 
-                                                        fifelse(P > 0 & S == 0 & N == 0 & S_34 == 0, "P", 
-                                                                fifelse(O > 0 & P == 0 & S == 0 & N == 0 & S_34 == 0, "CHO", 
-                                                                        fifelse(O == 0 & P == 0 & S == 0 & N == 0 & S_34 == 0, "CH", "None"))))))))]
+mz_recalibration <- function(
+    formulas,
+    spectrum,
+    ppm_tolerance   = 0.5,
+    ion             = 1.007825032 + -1 * 0.00054857990907,
+    S_MDL_limit     = 2,
+    hom_member_min  = 2,
+    showplot = F
+) {
+  SSE_1 <- NA
+  # 1) Subset only the columns you need from the original data to avoid carrying around large data:
+  #    If you still need all columns, remove the .() portion here.
   
-  results <- list()
   
-  calculate_group_connections <- function(dt_group) {
-    dt_group_unique <- dt_group
-    group_results <- list()
-    
-    for (diff_name in names(diffs)) {
-      diff_vector <- diffs[[diff_name]]
-      
-      diff_dt <- dt_group_unique[, .(
-        C = C + diff_vector["C"],
-        H = H + diff_vector["H"],
-        O = O + diff_vector["O"],
-        N = N + diff_vector["N"],
-        S = S + diff_vector["S"],
-        P = P + diff_vector["P"],
-        from_index = index
-      )]
-      
-      setkeyv(diff_dt, c("C", "H", "O", "N", "S", "P"))
-      setkeyv(dt_group_unique, c("C", "H", "O", "N", "S", "P"))
-      
-      matched <- dt_group_unique[diff_dt, nomatch = 0L]
-      
-      if (nrow(matched) > 0) {
-        connections <- matched[, .(
-          from_index = from_index,
-          to_index = index,
-          connection_type = diff_name
-        )]
-        group_results[[diff_name]] <- connections
-      }
-    }
-    
-    all_group_connections <- rbindlist(group_results, use.names = TRUE, fill = TRUE)
-    no_connections <- dt_group_unique[!index %in% unique(c(all_group_connections$from_index, all_group_connections$to_index)), .(
-      from_index = index,
-      to_index = NA,
-      connection_type = "No Connection"
-    )]
-    
-    all_group_connections <- rbind(all_group_connections, no_connections, fill = TRUE)
-    return(all_group_connections)
-  }
+  data <- copy(spectrum)
   
-  for (grp in unique(dt$group)) {
-    dt_group <- dt[group == grp]
-    group_connections <- calculate_group_connections(dt_group)
-    results[[grp]] <- group_connections
-  }
+  data_original <- copy (data)
   
-  all_connections <- rbindlist(results, use.names = TRUE, fill = TRUE)
-  Ak <- graph_from_data_frame(all_connections[!is.na(to_index)], directed = FALSE) %>% components()
-  membership_dt <- data.table(index = as.integer(names(Ak$membership)), homologues_membership = Ak$membership)
-  membership_dt[, homologues_membership := .N, by = homologues_membership]
-  out <- merge(dt, membership_dt, by = "index", all.x = TRUE)
-  out[is.na(homologues_membership), homologues_membership := 1]
-  gc()
-  return(out)
-}
-
-mz_recalibration <- function(formulas, dataset, ppm_tolerance = 0.5, 
-                             ion = 1.007825032 + -1 * 0.00054857990907, 
-                             S_MDL_limit = 1.5, hom_member_min = 1, showplot = TRUE) {
-  filtered_matches <- formula_assignment(formulas, dataset, ppm_tolerance = ppm_tolerance, ion = ion)[P == 0]
-  out <- filtered_matches[I / MDL > S_MDL_limit]
+  # 2) Filter data by I / MDL > S_MDL_limit directly
+  data <- data[I / MDL > S_MDL_limit]
   
+  # 3) Assign formulas and filter by atomic composition
+  out <- formula_assignment_multi_intensity(
+    formulas,
+    data,
+    ppm_tolerance = ppm_tolerance,
+    ion           = ion,
+    threshold = 200,
+    delete_singlets = F,
+    delete_MF_without_connection = F
+  )
+  out[, homologues_membership := NULL]
+  
+  # 4) Homologue-series calculation only if we still have enough data
   if (nrow(out) > 20) {
-    out <- calculate_connections(out)
-    out <- out[homologues_membership >= hom_member_min]
+    out <- calculate_connections(out)[homologues_membership >= hom_member_min]
   }
   
+  # 5) If the filtered data is still sufficiently large, proceed with outlier filtering + GAM model
   if (nrow(out) > 20) {
-    Q1 <- quantile(out$ppm, 0.25)
-    Q3 <- quantile(out$ppm, 0.75)
-    IQR <- Q3 - Q1
-    bounds <- c(Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
-    out <- out[ppm > bounds[1] & ppm < bounds[2]]
     
+    # -- Quantile-based filtering in data.table style
+    Q1   <- quantile(out$ppm, 0.25)
+    Q3   <- quantile(out$ppm, 0.75)
+    IQRv <- Q3 - Q1
+    out  <- out[ppm > (Q1 - 1.5 * IQRv) & ppm < (Q3 + 1.5 * IQRv)]
+    
+    SSE_1 <- round(sum(out$ppm^2),2)
+    
+    # -- Fit a GAM model
     gam_model <- gam(ppm ~ s(m.z, bs = "cs", k = 4), data = out)
+    plot(gam_model)
+    # -- Use in-place correction on data_original
+    #    This avoids creating a separate temporary data.table.
+    data_original[, predicted_drift_ppm :=
+                    predict(gam_model, newdata = .SD),
+                  .SDcols = "m.z"]
+    data_original[, m.z :=
+                    m.z * (1 + predicted_drift_ppm / 1e6)]
+    # Optionally remove the predicted_drift_ppm column
     
-    correct_new_data <- function(m.z, gam_model) {
-      new_data <- data.table(m.z)
-      new_data[, predicted_drift_ppm := predict(gam_model, newdata = new_data)]
-      new_data[, corrected_mz := m.z * (1 + predicted_drift_ppm / 1e6)]
-      return(new_data)
-    }
-    
-    pred <- correct_new_data(dataset$m.z, gam_model)
-    dataset[, m.z := pred$corrected_mz]
-    
-    if (showplot) {
-      pred <- subset(pred, m.z < max(filtered_matches$m.z))
-      
-      filtered_matches_2 <- formula_assignment(formulas, dataset, ppm_tolerance = ppm_tolerance, ion = ion)[P == 0]
-      out2 <- filtered_matches_2[I / MDL > S_MDL_limit]
-      out2 <- calculate_connections(out2)[homologues_membership >= hom_member_min]
-      
-      Q1_2 <- quantile(out2$ppm, 0.25)
-      Q3_2 <- quantile(out2$ppm, 0.75)
-      IQR_2 <- Q3_2 - Q1_2
-      bounds_2 <- c(Q1_2 - 1.5 * IQR_2, Q3_2 + 1.5 * IQR_2)
-      out2 <- out2[ppm > bounds_2[1] & ppm < bounds_2[2]]
-      
-      plot1 <- plot_ly() %>%
-        add_trace(
-          data = filtered_matches, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
-          marker = list(color = 'grey', size = 5), name = 'All assignments'
-        ) %>%
-        add_trace(
-          data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
-          marker = list(color = 'black', size = 5), name = 'Filtered assignments'
-        ) %>%
-        add_trace(
-          data = out, x = pred$corrected_mz, y = pred$predicted_drift_ppm, type = 'scatter', mode = 'lines',
-          line = list(color = 'red', width = 2), name = 'GAM Model'
-        ) %>%
-        layout(title = dataset$index[1], xaxis = list(title = "m/z"), yaxis = list(title = "ppm"))
-      
-      plot2 <- plot_ly() %>%
-        add_trace(
-          data = filtered_matches_2, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
-          marker = list(color = 'grey', size = 5), name = 'All assignments', showlegend = FALSE
-        ) %>%
-        add_trace(
-          data = out2, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
-          marker = list(color = 'black', size = 5), name = 'Filtered assignments', showlegend = FALSE
-        ) %>%
-        layout(xaxis = list(title = "m/z"), yaxis = list(title = "ppm"))
-      
-      plot <- subplot(plot1, plot2, shareY = TRUE, titleX = TRUE, titleY = TRUE)
-      print(paste0(dataset$index[1], " SSE before: ", round(sum(out$ppm^2), 2),
-                   "| SSE after: ", round(sum(out2$ppm^2), 2)))
-    } else {
-      plot <- plot_ly()
-    }
-    dataset <- dataset[, .(m.z, I, MDL, ResPow, index)]
   } else {
-    print(paste0(dataset$index[1], " Not enough points"))
-    plot <- plot_ly()
+   # message(paste0(data$index[1], " Not enough points"))
   }
   
-  print(paste0("Finished ", dataset$index[1]))
+ # message(paste0("Finished ", data$index[1]))
+  plot <- plot_ly()
+  SSE_2 <- NA
+  if(showplot & nrow(out) > 20){
+    plot1 <- plot_ly() %>%
+      
+      add_trace(data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
+                marker = list(color = 'grey', size = 5), name = paste0("SSE before: ",SSE_1)) %>%
+      add_trace(data = data_original, x = ~m.z, y = ~predicted_drift_ppm, type = 'scatter', mode = 'lines',
+                line = list(color = 'red', width = 2), name = 'GAM Model') %>%
+      layout(title = "placeholder", xaxis = list(title = "m/z", range=c(min(out$m.z),max(out$m.z))),
+             yaxis = list(title = "ppm", range=c(-ppm_tolerance,ppm_tolerance)))
+    
+    #repeat assignment
+    data <- data_original[I / MDL > S_MDL_limit]
+    
+    # 3) Assign formulas and filter by atomic composition
+    out <- formula_assignment_multi_intensity(
+      formulas,
+      data,
+      ppm_tolerance = ppm_tolerance,
+      ion           = ion,
+      threshold = 200,
+      delete_singlets = F,
+      delete_MF_without_connection = F
+    )
+    out[, homologues_membership := NULL]
+    
+    
+    out <- calculate_connections(out)[homologues_membership >= hom_member_min]
+    
+    
+    # -- Quantile-based filtering in data.table style
+    Q1   <- quantile(out$ppm, 0.25)
+    Q3   <- quantile(out$ppm, 0.75)
+    IQRv <- Q3 - Q1
+    out  <- out[ppm > (Q1 - 1.5 * IQRv) & ppm < (Q3 + 1.5 * IQRv)]
+    SSE_2 <- round(sum(out$ppm^2),2)
+    
+    plot2 <- plot_ly() %>%
+      
+      add_trace(data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
+                marker = list(color = 'black', size = 5), name = paste0("SSE after: ",SSE_2)) %>%
+      
+      layout(title = "placeholder", xaxis = list(title = "m/z", range=c(min(out$m.z),max(out$m.z))), yaxis = list(title = "ppm"))
+    
+    
+    plot <- subplot(plot1, plot2, shareY = T, titleX = T, titleY = T)
+    
+    
+  }
   gc()
-  return(list(data = dataset, plot = plot))
+  return(list(data =data_original[, .(m.z, I, MDL)],
+              plot = plot,
+              SSE_1 = SSE_1,
+              SSE_2 = SSE_2))
 }
 
 # -- Panel 3 UI --
@@ -592,13 +610,19 @@ panel3_ui <- fluidPage(
       numericInput("ppm_tolerance", "ppm tolerance:", value = 0.5, min = 0, step = 0.05),
       numericInput("S_MDL_limit", "S/MDL lower limit:", value = 2, min = 0, step = 0.1),
       numericInput("hom_member_min", "Homologue network length min:", value = 2, min = 1, step = 1),
-      actionButton("calculate_mz", "Recalibrate"),
-      # Removed the Previous/Next buttons; add a dynamic UI for the sample slider
+      actionButton("calculate_mz", "Recalibrate", class = "btn-lg btn-success"),
+      downloadButton("download_recalibrated", "Download as .rds")  ,
       uiOutput("sample_slider_ui")
     ),
     mainPanel(
       tabsetPanel(
-        tabPanel("Plot", plotlyOutput("mz_plot"))
+        tabPanel(
+          "Plot", 
+          fluidRow(
+            plotlyOutput("extra_plot"), # Extra plot above the main plot
+            plotlyOutput("mz_plot")    # Main m/z plot
+          )
+        )
       )
     )
   )
@@ -607,52 +631,54 @@ panel3_ui <- fluidPage(
 # -- Panel 3 Server --
 panel3_server <- function(input, output, session) {
   
-  # We'll store the list of recalibration results here
   recal_data <- reactiveVal(NULL)
   
-  # Event to trigger recalibration of all "samples_MDL" with "formulas"
   observeEvent(input$calculate_mz, {
-    
-    # Make sure "samples_MDL" and "formulas" exist in .GlobalEnv
     if (!exists("samples_MDL", envir = .GlobalEnv)) {
       showNotification("Error: 'samples_MDL' not found in global environment.", type = "error")
-      return(NULL)
-    }
-    if (!exists("formulas", envir = .GlobalEnv)) {
-      showNotification("Error: 'formulas' not found in global environment.", type = "error")
       return(NULL)
     }
     
     notification_id <- showNotification("Calculating...", type = "message", duration = NULL)
     
     local_samples <- get("samples_MDL", envir = .GlobalEnv)
-    local_formulas <- get("formulas", envir = .GlobalEnv)
+    #local_formulas <- get("molecular_formulas", envir = .GlobalEnv)
     
-    # Initialize progress bar
     progress <- Progress$new(session, min = 0, max = length(local_samples))
     on.exit(progress$close())
-    
-    # Recalibration
+    #formulas for calibration: more conservative range
+    formulas_calibration <- generate_formulas(C_range = 2:50, H_range = 2:100, O_range = 1:20,
+                                              P_range = 0:0, N_range = 0:1, S_range = 0:1,
+                                              HC= c(1,2), OC = c(0.2,0.8), mass_range = c(100, 1000), insert_isotopes = T)
     out_list <- lapply(seq_along(local_samples), function(i) {
       progress$set(value = i, message = "Processing samples", detail = paste0("Sample ", i, " of ", length(local_samples)))
-      mz_recalibration(subset(local_formulas, S == 0 & P == 0 ), local_samples[[i]],
+      
+      mz_recalibration(formulas_calibration, local_samples[[i]],
                        ppm_tolerance = input$ppm_tolerance,
                        S_MDL_limit = input$S_MDL_limit,
                        hom_member_min = input$hom_member_min,
                        showplot = TRUE)
     })
-    
-    # Save the list of results
     recal_data(out_list)
+    out_data <- lapply(out_list, function(x){x$data})
+    names(out_data) <- names(samples_MDL)
     
-    # Extract the data portion and assign to the global environment
-    data_only_list <- lapply(out_list, function(x) x$data)
-    assign("samples_MDL_recal_data", data_only_list, envir = .GlobalEnv)
+    #assign("samples_MDL_recal_data", lapply(out_list, `[[`, "data"), envir = .GlobalEnv)
+    assign("samples_MDL_recal_data", out_data, envir = .GlobalEnv)
+    
     removeNotification(notification_id)
     showNotification("MZ Recalibration complete! 'samples_MDL_recal_data' saved globally.", type = "message")
+    
+    output$download_recalibrated <- downloadHandler(
+      filename = function() {
+        paste("Recalibrated_samples", Sys.Date(), ".rds", sep = "")
+      },
+      content = function(file) {
+        saveRDS(out_data, file)
+      }
+    )
   })
   
-  # Dynamically generate the sample slider once recal_data() is available
   output$sample_slider_ui <- renderUI({
     req(recal_data())
     sliderInput(
@@ -665,16 +691,13 @@ panel3_server <- function(input, output, session) {
     )
   })
   
-  # Reactive value for the current sample index
   current_sample <- reactiveVal(1)
   
-  # Update current sample whenever the slider value changes
   observeEvent(input$sample_slider, {
     req(recal_data())
     current_sample(input$sample_slider)
   })
   
-  # Render the plot for the currently selected sample
   output$mz_plot <- renderPlotly({
     req(recal_data())
     idx <- current_sample()
@@ -682,8 +705,29 @@ panel3_server <- function(input, output, session) {
       recal_data()[[idx]]$plot
     }
   })
+  
+  # Generate the extra plot, unaffected by slider
+  output$extra_plot <- renderPlotly({
+    req(recal_data())
+    SSE_1 <- sapply(recal_data(), function(x) x$SSE_1)
+    SSE_2 <- sapply(recal_data(), function(x) x$SSE_2)
+    x <-seq_along(SSE_1)
+    plot_ly(
+      x = x,
+      y = SSE_1,
+      type = "scatter",
+      mode = "markers",
+      name = "SSE before"
+    ) %>%   add_trace(    x = x,
+    y = SSE_2,
+    type = "scatter",
+    mode = "markers",
+    name = "SSE after"
+  ) %>%  layout(title = "SSE before/after",
+                xaxis = list(title = "Sample Index"),
+                yaxis = list(title = "SSE"))
+  })
 }
-
 
 
 ###############################################################################
@@ -695,17 +739,17 @@ panel3_server <- function(input, output, session) {
 merge_mz_values <- function(dt, ppm_tolerance) {
   
   
-  # Rename columns d
-  setnames(dt, old = colnames(dt)[1], new = "mz")
-  setnames(dt, old = colnames(dt)[3], new = "MDL")
+  # # Rename columns 
+  # setnames(dt, old = colnames(dt)[1], new = "mz")
+  # setnames(dt, old = colnames(dt)[3], new = "MDL")
   
   # Sort by m/z
   
-  setorder(dt, mz)
+  setorder(dt, m.z)
   
   # Compute difference in ppm between consecutive m/z
-  dt[, diff_ppm := (mz - shift(mz, type = "lag")) / shift(mz, type = "lag") * 1e6]
-  # Replace the first NA with Inf (equivalent to c(Inf, diff(mz))/mz * 1e6)
+  dt[, diff_ppm := (m.z - shift(m.z, type = "lag")) / shift(m.z, type = "lag") * 1e6]
+  # Replace the first NA with Inf (equivalent to c(Inf, diff(m.z))/m.z * 1e6)
   dt[is.na(diff_ppm), diff_ppm := Inf]
   
   # Identify groups whose differences exceed ppm_tolerance
@@ -716,15 +760,15 @@ merge_mz_values <- function(dt, ppm_tolerance) {
     sqrt_I <- sqrt(I)
     sum_sqrt_I <- sum(sqrt_I)
     .(
-      merged_mz = sum(mz * sqrt_I) / sum_sqrt_I,
+      merged_m.z = sum(m.z * sqrt_I) / sum_sqrt_I,
       mean_MDL  = MDL[1],            #MDL should be the same accross all samples.                   
-      SE        = sd(mz) / (sum(mz * sqrt_I) / sum_sqrt_I) * 1e6
+      SE        = sd(m.z) / (sum(m.z * sqrt_I) / sum_sqrt_I) * 1e6
     )
   }, by = group]
   
   # Update-join  to add columns back
   dt[merged, on = "group", `:=`(
-    merged_mz = i.merged_mz,
+    merged_m.z = i.merged_m.z,
     mean_MDL  = i.mean_MDL,
     SE        = i.SE
   )]
@@ -735,13 +779,13 @@ merge_mz_values <- function(dt, ppm_tolerance) {
   # Reshape to wide format; each index becomes a column
   dt_wide <- dcast(
     dt2,
-    merged_mz + mean_MDL + SE ~ index,
+    merged_m.z + mean_MDL + SE ~ index,
     value.var = "I",
     fill = NA
   )
   
   # Rename columns for the final output
-  setnames(dt_wide, old = c("merged_mz", "mean_MDL"), new = c("m.z", "MDL"))
+  setnames(dt_wide, old = c("merged_m.z", "mean_MDL"), new = c("m.z", "MDL"))
   gc()
   return(dt_wide)
 }
@@ -753,7 +797,8 @@ panel4_ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       numericInput("ppm_tolerance_merge", "PPM Tolerance:", value = 0.5, min = 0, step = 0.1),
-      actionButton("calculate_merge", "Merge samples")
+      actionButton("calculate_merge", "Merge samples", class = "btn-lg btn-success"),
+      downloadButton("download_csv_merged", "Download CSV")  
     ),
     mainPanel(
       verbatimTextOutput("status_merge"),
@@ -779,7 +824,7 @@ panel4_server <- function(input, output, session) {
     
     tryCatch({
       local_samples <- get("samples_MDL_recal_data", envir = .GlobalEnv)
-      combined_dt <- rbindlist(local_samples, fill = TRUE)
+      combined_dt <- rbindlist(local_samples, fill = TRUE, idcol = "index")
       result_dt <- merge_mz_values(combined_dt, ppm_tolerance = input$ppm_tolerance_merge)
       
       # Assign result to global environment
@@ -792,6 +837,14 @@ panel4_server <- function(input, output, session) {
     output$results_table_merge <- renderDT({
       head(result_dt)
     })
+    output$download_csv_merged <- downloadHandler(
+      filename = function() {
+        paste("Merged_samples", Sys.Date(), ".csv", sep = "")
+      },
+      content = function(file) {
+        fwrite(result_dt, file)
+      }
+    )
     
   })
 }
@@ -872,137 +925,152 @@ calculate_group_connections <- function(dt_group, diffs) {
 
 # --- Main Functions ---
 
-# Calculate isotopes
+# Main function: calculate isotopes
 calculate_isotopes <- function(filtered_matches, dataset) {
   
   # Identify intensity columns
-  intensity_cols <- setdiff(names(dataset), c("m.z", "MDL", "SE", "ResPow", "m.z_ion", "index"))
+  intensity_cols <- setdiff(
+    names(dataset),
+    c("m.z", "MDL", "SE", "m.z_ion", "index")
+  )
   
   # Compute combined intensities (rowMeans if >1 column, or single column)
   if (length(intensity_cols) > 1) {
-    intensities <- dataset[, .(m.z, intensities = rowMeans(.SD, na.rm = TRUE)), 
+    intensities <- dataset[, .(m.z, intensities = rowMeans(.SD, na.rm = TRUE)),
                            .SDcols = intensity_cols]
   } else {
     intensities <- dataset[, .(m.z, intensities = get(intensity_cols))]
   }
   
-  # Merge intensities onto filtered_matches
-  filtered_matches <- merge(filtered_matches, intensities, 
+  # Merge intensities into filtered_matches
+  filtered_matches <- merge(filtered_matches, intensities,
                             by.x = "m.z", by.y = "m.z", all.x = TRUE)
   
   # Split into parent vs. child isotopes
-  parent_all     <- filtered_matches[C_13 == 0 & O_18 == 0 & S_34 == 0]
-  child_C_1_all  <- filtered_matches[C_13 == 1 & O_18 == 0 & S_34 == 0]
-  child_C_2_all  <- filtered_matches[C_13 == 2 & O_18 == 0 & S_34 == 0]
-  child_O_all    <- filtered_matches[C_13 == 0 & O_18 == 1 & S_34 == 0]
-  child_S_all    <- filtered_matches[C_13 == 0 & O_18 == 0 & S_34 == 1]
+  parent_all    <- filtered_matches[C_13 == 0 & O_18 == 0 & S_34 == 0]
+  child_C_1_all <- filtered_matches[C_13 == 1 & O_18 == 0 & S_34 == 0]
+  child_C_2_all <- filtered_matches[C_13 == 2 & O_18 == 0 & S_34 == 0]
+  child_O_all   <- filtered_matches[C_13 == 0 & O_18 == 1 & S_34 == 0]
+  child_S_all   <- filtered_matches[C_13 == 0 & O_18 == 0 & S_34 == 1]
   
-  # Merge them parent->child
-  result_C1 <- merge(parent_all, child_C_1_all,
-                     by = c("C", "H", "O", "N", "S", "P"),
-                     suffixes = c("_parent", "_child"))
-  result_C2 <- merge(parent_all, child_C_2_all,
-                     by = c("C", "H", "O", "N", "S", "P"),
-                     suffixes = c("_parent", "_child"))
-  result_O  <- merge(parent_all, child_O_all,
-                     by = c("C", "H", "O", "N", "S", "P"),
-                     suffixes = c("_parent", "_child"))
-  result_S  <- merge(parent_all, child_S_all,
-                     by = c("C", "H", "O", "N", "S", "P"),
-                     suffixes = c("_parent", "_child"))
+  # Merge parent and child sets
+  result_C1 <- merge(
+    parent_all, child_C_1_all,
+    by = c("C", "H", "O", "N", "S", "P"),
+    suffixes = c("_parent", "_child")
+  )
+  result_C2 <- merge(
+    parent_all, child_C_2_all,
+    by = c("C", "H", "O", "N", "S", "P"),
+    suffixes = c("_parent", "_child")
+  )
+  result_O <- merge(
+    parent_all, child_O_all,
+    by = c("C", "H", "O", "N", "S", "P"),
+    suffixes = c("_parent", "_child")
+  )
+  result_S <- merge(
+    parent_all, child_S_all,
+    by = c("C", "H", "O", "N", "S", "P"),
+    suffixes = c("_parent", "_child")
+  )
   
-  # Filter out where parent intensities <= child intensities
-  # ( only keep lines where intensities_parent > intensities_child)
+  # Filter out lines where parent intensity <= child intensity
   result_C1 <- result_C1[intensities_parent > intensities_child]
   result_C2 <- result_C2[intensities_parent > intensities_child]
   result_O  <- result_O[intensities_parent > intensities_child]
   result_S  <- result_S[intensities_parent > intensities_child]
   
-  # Calculate deviance in each isotopic group
+  # Calculate isotope deviance in each group, row by row
   col_parent <- "intensities_parent"
   col_child  <- "intensities_child"
   
-  #  use row-by-row by=seq_len(nrow(.)) 
   result_C1[, isotope_deviance_C_13_1 := isotope_deviance(
-    as.numeric(get(col_parent)), as.numeric(get(col_child)),
-    number_of_atoms = C, q = 0.0108, p = 1 - 0.0108, number_of_isotopes = 1
+    as.numeric(get(col_parent)),
+    as.numeric(get(col_child)),
+    number_of_atoms = C,
+    q = 0.0108,
+    p = 1 - 0.0108,
+    number_of_isotopes = 1
   ), by = seq_len(nrow(result_C1))]
   
   result_C2[, isotope_deviance_C_13_2 := isotope_deviance(
-    as.numeric(get(col_parent)), as.numeric(get(col_child)),
-    number_of_atoms = C, q = 0.0108, p = 1 - 0.0108, number_of_isotopes = 2
+    as.numeric(get(col_parent)),
+    as.numeric(get(col_child)),
+    number_of_atoms = C,
+    q = 0.0108,
+    p = 1 - 0.0108,
+    number_of_isotopes = 2
   ), by = seq_len(nrow(result_C2))]
   
   result_O[, isotope_deviance_O_18 := isotope_deviance(
-    as.numeric(get(col_parent)), as.numeric(get(col_child)),
-    number_of_atoms = O, q = 0.00205, p = 1 - 0.00205, number_of_isotopes = 1
+    as.numeric(get(col_parent)),
+    as.numeric(get(col_child)),
+    number_of_atoms = O,
+    q = 0.00205,
+    p = 1 - 0.00205,
+    number_of_isotopes = 1
   ), by = seq_len(nrow(result_O))]
   
   result_S[, isotope_deviance_S_34 := isotope_deviance(
-    as.numeric(get(col_parent)), as.numeric(get(col_child)),
-    number_of_atoms = S, q = 0.0437, p = 1 - 0.0437, number_of_isotopes = 1
+    as.numeric(get(col_parent)),
+    as.numeric(get(col_child)),
+    number_of_atoms = S,
+    q = 0.0437,
+    p = 1 - 0.0437,
+    number_of_isotopes = 1
   ), by = seq_len(nrow(result_S))]
   
-  # Combine parent + isotopic children
-  #full_results <- rbind(parent_all, result_C1, result_C2, result_O, result_S, fill = TRUE)
   
-  # Identify columns with '_parent' and '_child'
-  parent_cols <- grep("_parent$", colnames(result_C1), value = TRUE)
-  child_cols <- grep("_child$", colnames(result_C1), value = TRUE)
+  # 1) Identify columns with '_parent' or '_child'
+  #    (we do this once; assume each "result_X" has consistent column naming)
+  parent_cols <- grep("_parent$", names(result_C1), value = TRUE)
+  child_cols  <- grep("_child$",  names(result_C1), value = TRUE)
   
-  # Combine with C H O N S P columns (which are common)
+  # 2) Common columns in your data
   common_cols <- c("C", "H", "O", "N", "S", "P")
   
-  # Create separate data.tables for parent and child
-  parent_C1 <- result_C1[, c(common_cols, parent_cols,"isotope_deviance_C_13_1"), with = FALSE]
-  result_C1 <- result_C1[, c(common_cols, child_cols,"isotope_deviance_C_13_1"), with = FALSE]
+  # 3) For each merged result (C1, C2, O, S), create a 'parent' table and 'child' table
+  #    removing the 'intensities' column in each subset to avoid duplication.
+  #    Then rename columns to remove _parent and _child suffixes for clarity.
+  split_and_rename <- function(dt, iso_col) {
+    dt_parent <- dt[, c(common_cols, parent_cols, iso_col), with = FALSE]
+    dt_child  <- dt[, c(common_cols, child_cols,  iso_col), with = FALSE]
+    
+    setnames(dt_parent, gsub("_parent$", "", names(dt_parent)))
+    setnames(dt_child,  gsub("_child$",  "", names(dt_child)))
+    
+    # Remove 'intensities' column in each subset if present
+    if ("intensities" %in% names(dt_parent)) dt_parent[, intensities := NULL]
+    if ("intensities" %in% names(dt_child))  dt_child[, intensities := NULL]
+    
+    return(list(parent = dt_parent, child = dt_child))
+  }
   
-  parent_C2 <- result_C2[, c(common_cols, parent_cols,"isotope_deviance_C_13_2"), with = FALSE]
-  result_C2 <- result_C2[, c(common_cols, child_cols,"isotope_deviance_C_13_2"), with = FALSE]
-  
-  parent_O <- result_O[, c(common_cols, parent_cols,"isotope_deviance_O_18"), with = FALSE]
-  result_O <- result_O[, c(common_cols, child_cols,"isotope_deviance_O_18"), with = FALSE]
-  
-  parent_S <- result_S[, c(common_cols, parent_cols,"isotope_deviance_S_34"), with = FALSE]
-  result_S <- result_S[, c(common_cols, child_cols,"isotope_deviance_S_34"), with = FALSE]
-  
-  # remove the '_parent' and '_child' suffixes for better readability
-  setnames(parent_C1, gsub("_parent$", "", colnames(parent_C1)))
-  setnames(result_C1, gsub("_child$", "", colnames(result_C1)))
-  setnames(parent_C2, gsub("_parent$", "", colnames(parent_C2)))
-  setnames(result_C2, gsub("_child$", "", colnames(result_C2)))
-  setnames(parent_O, gsub("_parent$", "", colnames(parent_O)))
-  setnames(result_O, gsub("_child$", "", colnames(result_O)))
-  setnames(parent_S, gsub("_parent$", "", colnames(parent_S)))
-  setnames(result_S, gsub("_child$", "", colnames(result_S)))
-  
-  parent_C1[, intensities := NULL]
-  parent_C2[, intensities := NULL]
-  parent_O[, intensities := NULL]
-  parent_S[, intensities := NULL]
-  result_C1[, intensities := NULL]
-  result_C2[, intensities := NULL]
-  result_O[, intensities := NULL]
-  result_S[, intensities := NULL]
-  
-  parent_all[, intensities := NULL]
+  pc_C1 <- split_and_rename(result_C1, "isotope_deviance_C_13_1")
+  pc_C2 <- split_and_rename(result_C2, "isotope_deviance_C_13_2")
+  pc_O  <- split_and_rename(result_O,  "isotope_deviance_O_18")
+  pc_S  <- split_and_rename(result_S,  "isotope_deviance_S_34")
   
   
-  isotopes <-merge(result_C1, result_C2, 
-                   by = colnames(result_C1)[-ncol(result_C1)], all = T) 
+  by_child <- names(pc_C1$child)[-ncol(pc_C1$child)]
   
-  isotopes <- merge(isotopes, result_O, 
-                    by = colnames(parent_C1)[-ncol(parent_C1)], all = T)
-  isotopes <- merge(isotopes, result_S, 
-                    by = colnames(parent_C1)[-ncol(parent_C1)], all = T)
+  isotopes <- merge(pc_C1$child, pc_C2$child, by = by_child, all = TRUE)
+  isotopes <- merge(isotopes, pc_O$child, by = by_child, all = TRUE)
+  isotopes <- merge(isotopes, pc_S$child, by = by_child, all = TRUE)
   
-  out <- rbind(parent_all, isotopes, fill =T)
+  
+  if ("intensities" %in% names(parent_all)) {
+    parent_all[, intensities := NULL]
+  }
+  
+  # Combine 'parent_all' with all isotopes
   gc()
-  return(out)
+  return(rbind(parent_all, isotopes, fill = TRUE))
 }
 
 # Calculate homologous connections (panel 5)
-calculate_connections_panel5 <- function(dt, diffs = list(
+calculate_connections <- function(dt, diffs = list(
   CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
   H   = c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
 )) {
@@ -1055,42 +1123,47 @@ formula_assignment_multi_intensity <- function(
       H   = c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
     )
 ) {
+  dat <- copy(dataset) #create a clean copy to remove referencing to old dataset
+
   # Adjust m.z by the chosen ion mass
-  dataset$m.z_ion <- dataset$m.z
-  dataset$m.z     <- dataset$m.z + ion
+  dat[, m.z_ion := m.z]
+  dat[, m.z := m.z + ion]
   
   # Generate tolerance columns
-  dataset[, `:=`(lower_limit = m.z * (1 - ppm_tolerance / 1e6),
+  dat[, `:=`(lower_limit = m.z * (1 - ppm_tolerance / 1e6),
                  upper_limit = m.z * (1 + ppm_tolerance / 1e6))]
-  
+
   # Prepare formula data and set keys for overlap
   formulas[, `:=`(start = calculated_m.z, end = calculated_m.z)]
   data.table::setkey(formulas, start, end)
-  data.table::setkey(dataset, lower_limit, upper_limit)
+  data.table::setkey(dat, lower_limit, upper_limit)
   
+  all_matches <- data.table()
   # Overlap join
   all_matches <- foverlaps(
-    formulas, dataset, 
+    formulas, dat, 
     by.x = c("start", "end"),
     by.y = c("lower_limit", "upper_limit"),
     type = "within", nomatch = 0
   )
-  dataset[, `:=`(lower_limit = NULL, upper_limit = NULL)]
+  dat[, `:=`(lower_limit = NULL, upper_limit = NULL)]
   
   # Calculate error & filter columns
   all_matches[, absolute_error := calculated_m.z - m.z]
   all_matches[, ppm := (absolute_error / m.z) * 1e6]
   
+  filtered_matches <- data.table()
   filtered_matches <- all_matches[, .(
     m.z_ion, m.z, calculated_m.z, absolute_error, ppm,
     C, H, O, N, S, P, C_13, O_18, S_34
   )]
   
+  all_matches <- NULL
   # 1) Isotope peak verification
-  filtered_matches <- calculate_isotopes(filtered_matches, dataset = dataset)
+  filtered_matches <- calculate_isotopes(filtered_matches, dat = dat)
   
   # 2) Homologous series calculation
-  filtered_matches <- calculate_connections_panel5(filtered_matches, diffs = homologues_network)
+  filtered_matches <- calculate_connections(filtered_matches, diffs = homologues_network)
   filtered_matches[, index := NULL]
   
   # Threshold test
@@ -1117,7 +1190,7 @@ formula_assignment_multi_intensity <- function(
     )
     
     # Recompute connections
-    filtered_matches <- calculate_connections_panel5(
+    filtered_matches <- calculate_connections(
       filtered_matches, diffs = homologues_network
     )
   }
@@ -1174,18 +1247,24 @@ formula_assignment_multi_intensity <- function(
   )
   filtered_matches <- filtered_matches[, ..filter_cols]
   
-  # Merge original dataset columns back in and track presence
-  dataset[, m.z := NULL]
-  filtered_matches <- merge(filtered_matches, dataset, 
+  # Merge original dat columns back in and track presence
+  dat[, m.z := NULL]
+  filtered_matches <- merge(filtered_matches, dat, 
                             by.x = "m.z_ion", by.y = "m.z_ion", all.x = TRUE)
-  filtered_matches[, present_in := rowSums(!is.na(.SD)),
-                   .SDcols = (ncol(filtered_matches) - length(filter_cols)):ncol(filtered_matches)]
+
+  selected_cols <- setdiff(names(filtered_matches), filter_cols) # Remove filter_cols
+  selected_cols <- selected_cols[!grepl("SE|MDL|predicted_drift_ppm", selected_cols)] # Exclude columns containing "SE" or "MDL"
+  
+
+  filtered_matches[, present_in := rowSums(!is.na(.SD)), .SDcols = selected_cols]
+
   
   # Move `present_in` column to just after the filter_cols
   filter_col_names <- names(filtered_matches)[1:length(filter_cols)]
   setcolorder(filtered_matches, c(filter_col_names, "present_in",
                                   setdiff(names(filtered_matches),
                                           c(filter_col_names, "present_in"))))
+
   
   # Delete singlets if chosen
   if (delete_singlets) {
@@ -1198,14 +1277,20 @@ formula_assignment_multi_intensity <- function(
     if (delete_singlets) {
       temp <- copy(filtered_matches)
       temp[, homologues_membership := NULL]
-      filtered_matches$homologues_membership <- calculate_connections_panel5(
+      filtered_matches$homologues_membership <- calculate_connections(
         temp, diffs = homologues_network
       )$homologues_membership
     }
     filtered_matches <- subset(filtered_matches, homologues_membership > 1)
+    temp <- NULL
   }
   
   setorder(filtered_matches, m.z)
+  dat <- NULL
+  formulas[, start := NULL]
+  formulas[, end := NULL]
+  
+  
   gc()
   return(filtered_matches)
 }
@@ -1233,7 +1318,8 @@ panel5_ui <- fluidPage(
                            "NH3"  = "NH3"
                          ),
                          selected = c("CH2",  "O")),
-      actionButton("calculate_panel5", "Assign Formulas"),
+      actionButton("calculate_panel5", "Assign Formulas", class = "btn-lg btn-success"),
+      downloadButton("download_csv_crosstab", "Download CSV") ,
       textOutput("status_panel5")
     ),
     mainPanel(
@@ -1251,7 +1337,7 @@ panel5_server <- function(input, output, session) {
     output$status_panel5 <- renderText("Calculating...")
     
     # Ensure we have 'formulas' and 'merged_samples' in global environment
-    if (!exists("formulas", envir = .GlobalEnv)) {
+    if (!exists("molecular_formulas", envir = .GlobalEnv)) {
       output$status_panel5 <- renderText("Error: 'formulas' is not found in the global environment.")
       return(NULL)
     }
@@ -1260,7 +1346,7 @@ panel5_server <- function(input, output, session) {
       return(NULL)
     }
     
-    local_formulas <- get("formulas", envir = .GlobalEnv)
+    local_formulas <- get("molecular_formulas", envir = .GlobalEnv)
     local_water_dt <- get("merged_samples", envir = .GlobalEnv)
     
     tryCatch({
@@ -1292,6 +1378,16 @@ panel5_server <- function(input, output, session) {
       assign("crosstab", result, envir = .GlobalEnv)
       output$status_panel5 <- renderText("Calculation complete. Results saved to 'crosstab' in your R environment.")
       removeNotification(notification_id)
+      
+      output$download_csv_crosstab <- downloadHandler(
+        filename = function() {
+          paste("crosstab", Sys.Date(), ".csv", sep = "")
+        },
+        content = function(file) {
+          fwrite(result, file)
+        }
+      )
+      
     }, error = function(e) {
       output$status_panel5 <- renderText(paste("Error:", e$message))
     })
@@ -1300,6 +1396,8 @@ panel5_server <- function(input, output, session) {
   output$results_table_panel_5 <- renderDT({
     crosstab()
   })
+  
+  
 }
 
 
