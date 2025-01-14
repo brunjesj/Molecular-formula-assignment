@@ -137,9 +137,10 @@ panel1_server <- function(input, output, session) {
   })
   
   samples_MDL <- eventReactive(input$calculate, {
-    req(blanks_data(), samples_data())
     notification_id <- showNotification("Calculating...", type = "message", duration = NULL)
     
+    req(blanks_data(), samples_data())
+
     blank_list <- blanks_data()
     sample_list <- samples_data()
     
@@ -646,13 +647,13 @@ panel3_server <- function(input, output, session) {
     
     progress <- Progress$new(session, min = 0, max = length(local_samples))
     on.exit(progress$close())
+    
     #formulas for calibration: more conservative range
     formulas_calibration <- generate_formulas(C_range = 2:50, H_range = 2:100, O_range = 1:20,
                                               P_range = 0:0, N_range = 0:1, S_range = 0:1,
                                               HC= c(1,2), OC = c(0.2,0.8), mass_range = c(100, 1000), insert_isotopes = T)
     out_list <- lapply(seq_along(local_samples), function(i) {
       progress$set(value = i, message = "Processing samples", detail = paste0("Sample ", i, " of ", length(local_samples)))
-      
       mz_recalibration(formulas_calibration, local_samples[[i]],
                        ppm_tolerance = input$ppm_tolerance,
                        S_MDL_limit = input$S_MDL_limit,
@@ -899,7 +900,9 @@ calculate_group_connections <- function(dt_group, diffs) {
     setkeyv(diff_dt, c("C", "H", "O", "N", "S", "P"))
     setkeyv(dt_group, c("C", "H", "O", "N", "S", "P"))
     
-    matched <- dt_group[diff_dt, nomatch = 0L]
+    #the following can throw an error if allow.cartesian is not set to true.
+    #need to investigate the reason.
+    matched <- dt_group[diff_dt, nomatch = 0L, allow.cartesian = TRUE]
     
     if (nrow(matched) > 0) {
       group_results[[diff_name]] <- matched[, .(
@@ -1260,10 +1263,9 @@ formula_assignment_multi_intensity <- function(
 
   
   # Move `present_in` column to just after the filter_cols
-  filter_col_names <- names(filtered_matches)[1:length(filter_cols)]
-  setcolorder(filtered_matches, c(filter_col_names, "present_in",
-                                  setdiff(names(filtered_matches),
-                                          c(filter_col_names, "present_in"))))
+  filter_col_names <- c(names(filtered_matches)[1:length(filter_cols)], "present_in", "MDL")
+  setcolorder(filtered_matches, c(filter_col_names,setdiff(names(filtered_matches),
+                                                                    c(filter_col_names))))
 
   
   # Delete singlets if chosen
