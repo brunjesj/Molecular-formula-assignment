@@ -23,11 +23,45 @@ library(igraph)
 # Set maximum file size (adjust as needed)
 options(shiny.maxRequestSize = 4096 * 4096 * 4096)
 
+calculate_noise <- function(blank, approach=1, confidence_level = 0.998, MDL_level = 2.5){
+  colnames(blank)[1] <- "m.z"
+  colnames(blank)[2] <- "I"
+  blank$I <- as.numeric(blank$I)
+
+  blank[, nominal_mass := floor(m.z + 0.5)]
+
+  if (approach == 1) {
+    # Use Riedel-based formula (t-statistic with user-defined confidence level)
+    res <- blank[, .(
+      MDL = qt(confidence_level, df = .N - 1) * sd(I) + mean(I)
+    ), by = nominal_mass]
+  }
+  if(approach ==2){
+    # Use Merder 2020 approach with a fixed factor * sd + mean
+    res <-   blank[, .(
+      MDL = mean(I, na.rm = TRUE) + MDL_level * sd(I, na.rm = TRUE)
+    ), by = nominal_mass]
+  }
+  if(approach ==3){
+    #this would be a quantile-based approach where 99% (chosen confidence) of the signal intensities detected in the blank would be excluded
+    #for each nominal mass
+    res <-  blank[, .(
+      MDL = quantile(I, probs = confidence_level, na.rm = TRUE)
+    ), by = nominal_mass]
+  }
+  return(res)
+}
+
 # Function to remove outliers in ResPow based on quantile regression
-ResPow_outlier <- function(dataset) {
+ResPow_outlier <- function(dataset, showplot = F) {
+  colnames(dataset)[1] <- "m.z"
+
+  nrow_initial <- nrow(dataset)
+  
+  dataset <- na.omit(dataset, cols = c("Res.", "m.z"))
   
   # Fit quantile regression model
-  d <- rq(log(ResPow) ~ log(m.z), data = dataset, method = "fn")
+  d <- rq(log(Res.) ~ log(m.z), data = dataset, method = "fn")
   
   # Density of residuals
   dens <- density(d$residuals)
@@ -44,34 +78,57 @@ ResPow_outlier <- function(dataset) {
   # If no threshold is found, use Inf
   if (is.na(e)) e <- Inf
   
-  # Return only rows whose residuals are within ±e
-  dataset[d$residuals <= abs(e)]
+  if(showplot == T){
+    plot <- plot_ly (type = "scatter", mode = "markers")
+    plot <- plot %>% add_trace(x = dataset$m.z, y = dataset$Res., name = "kept")
+    
+    removed <-dataset[which(d$residuals > abs(e))]
+    
+    plot <- plot %>% add_trace(x = removed$m.z, y = removed$Res., name = "removed")
+    plot <- plot %>% layout(xaxis = list(title = "m/z"), yaxis = list ( title = "Resolution"))
+    print(plot)
+  }
+
   
-  dataset[, ResPow := NULL]
+
+  # Return only rows whose residuals are within ±e
+  dataset <-dataset[which(d$residuals <= abs(e))]
+  nrow_after <- nrow(dataset)
+  message(paste0("Removed ",nrow_initial-nrow_after, " outlier entries"))
+  dataset[, Res. := NULL]
   
 }
 
 # Function to process samples and remove peaks below MDL
-process_samples_MDL <- function(sample, MDL_master) {
-  #0. change integer 64 into numeric for intensity
+process_samples_MDL <- function(sample, MDL_master, remove_resolution_outliers = T
+) {
+  #change integer 64 into numeric for intensity
+  colnames(sample)[1] <- "m.z"
+  colnames(sample)[2] <- "I"
   sample[, I := as.numeric(I)]
   
-  # 1. Rename columns in place
-  setnames(sample, old = "m/z", new = "m.z", skip_absent = TRUE)
+  #Calculate nominal_mz
+  sample[, nominal_mass := floor(m.z + 0.5)]
   
-  # 2. Calculate nominal_mz
-  sample[, nominal_mz := floor(m.z + 0.5)]
-  
-  # 3. Merge, then filter to keep only rows above MDL, 
-  #    and pick the necessary columns in a single step.
-  # 4. Immediately pass the result to ResPow_outlier() to remove outliers.
-  merge(
-    sample, MDL_master, by.x = "nominal_mz", by.y = "m.z", all.x = TRUE
-  )[
-    I >= MDL,
-    .(m.z, I, MDL, ResPow = Res.)
-  ] |>
-    ResPow_outlier()
+  if (any(colnames(sample)=="Res." & remove_resolution_outliers ==T)){
+    # 3. Merge, then filter to keep only rows above MDL, 
+    #    and pick the necessary columns in a single step.
+    setkey(sample, nominal_mass)
+    setkey(MDL_master, nominal_mass)
+    
+    # Filter sample based on MDL
+    sample[MDL_master, on = "nominal_mass"][I >= MDL,
+                                            .(m.z, I, MDL, Res.)] |>
+      ResPow_outlier()
+  }else {
+    
+    setkey(sample, nominal_mass)
+    setkey(MDL_master, nominal_mass)
+    
+    # Filter sample based on MDL
+    sample[MDL_master, on = "nominal_mass"][I >= MDL,
+                                            .(m.z, I, MDL)]
+  }
 }
 
 # -- Panel 1 UI --
@@ -90,24 +147,26 @@ panel1_ui <- fluidPage(
       radioButtons(
         inputId = "approach", 
         label = "Select MDL calculation approach:",
-        choices = c("Riedel 2014 approach", "Merder 2020 approach")
+        choices = c("Riedel 2014 approach" = 1, "Merder 2020 approach" = 2),
+        selected = 1 
       ),
       
       # Conditional panel for inputs relevant only to Riedel 2014 approach
       conditionalPanel(
-        condition = "input.approach == 'Riedel 2014 approach'",
-        numericInput("confidence_level_riedel", 
-                     "Confidence Level (Riedel):", 
+        condition = "input.approach == '1'",
+        numericInput("confidence_level", 
+                     "Confidence Level:", 
                      value = 0.998, min = 0, max = 1, step = 0.001)
       ),
       
       # Conditional panel for inputs relevant only to Merder 2020 approach
       conditionalPanel(
-        condition = "input.approach == 'Merder 2020 approach'",
-        numericInput("MDL_level_Merder", 
+        condition = "input.approach == '2'",
+        numericInput("MDL_level", 
                      "MDL_level:", 
                      value = 2.5, min = 1, step = 0.1)
       ),
+      checkboxInput("remove_resolution_outliers", "Remove resolution outliers", value = TRUE),
       
       actionButton("calculate", "Calculate", class = "btn-lg btn-success"),
       downloadButton("download_MDL", "Download as .rds")  ,
@@ -115,7 +174,11 @@ panel1_ui <- fluidPage(
     ),
     
     mainPanel(
-      verbatimTextOutput("status"),
+      h4("Blanks Data Preview (First File)"),
+      tableOutput("blanks_preview"),
+      h4("Samples Data Preview (First File)"),
+      tableOutput("samples_preview"),
+      h4("Overview processed samples"),
       tableOutput("overview")
     )
   )
@@ -138,114 +201,104 @@ panel1_server <- function(input, output, session) {
   
   samples_MDL <- eventReactive(input$calculate, {
     notification_id <- showNotification("Calculating...", type = "message", duration = NULL)
+
     
     req(blanks_data(), samples_data())
+    
+    progress1 <- Progress$new(session, min = 0, max = length(blanks_data()))
+    on.exit(progress1$close())
 
-    blank_list <- blanks_data()
-    sample_list <- samples_data()
+    #blank_list <- blanks_data()
+    #sample_list <- samples_data()
+    
+    # Initialize progress bar
+
     
     
     # Step 1: Compute MDL_master based on user-selected approach
-    MDL_master <- lapply(blank_list, function(blank) {
-      colnames(blank)[1] <- "m.z"
-      blank[, nominal_mass := floor(m.z + 0.5)]
-      if (input$approach == "Riedel 2014 approach") {
-        # Use Riedel-based formula (t-statistic with user-defined confidence level)
-        blank[, .(
-          MDL = qt(input$confidence_level_riedel, df = .N - 1) * sd(I) + mean(I)
-        ), by = nominal_mass]
-      } else {
-        # Use Merder 2020 approach
-
-
-
-          
-          sd_I <- sd(blank$I, na.rm = TRUE)
-          mean_I <- mean(blank$I, na.rm = TRUE)
-          blank[, z_score_I := (I - mean_I) / sd_I]
-          
-
-          
-          blank[, MDL_z_score := mean(z_score_I, na.rm = TRUE) + 
-                  input$MDL_level_Merder * sd(z_score_I, na.rm = TRUE), 
-                by = nominal_mass]
-          # Fit a GAM model
-          gam_model <- gam(MDL_z_score ~ s(m.z, bs = "cs", k = 4), data = blank)
-
-          unique_nominal_mz <- unique(blank[, .(nominal_mass)])
-          setnames(unique_nominal_mz, 1, "m.z")
-          
-          unique_nominal_mz<- unique_nominal_mz[, MDL := predict(gam_model, newdata = .SD)* sd_I + mean_I]
- 
-          colnames(unique_nominal_mz)[1] <- "nominal_mass"
-          unique_nominal_mz
-        
-
-        
-        
-        
-        
-      }
-    }) %>% rbindlist()
-
-    MDL_master <- MDL_master[, .(MDL = round(mean(MDL))), by = nominal_mass]
-    setnames(MDL_master, "nominal_mass", "m.z")
-
-    # Initialize progress bar
-    progress <- Progress$new(session, min = 0, max = length(sample_list))
-    on.exit(progress$close())
-    
-
-    # Process samples
-    processed_samples <- lapply(seq_along(sample_list), function(i) {
-      progress$set(value = i, message = "Processing samples", detail = paste0("Sample ", i, " of ", length(sample_list)))
-      sample <- sample_list[[i]]
-      process_samples_MDL(
-        sample      = sample_list[[i]], 
-        MDL_master  = MDL_master
-      )
+    MDL_master <- lapply(seq_along(blanks_data()), function(i) {
+      progress1$set(value = i, message = "Processing blanks", detail = paste0("Blank ", i, " of ", length(blanks_data())))
       
-    })
+      
+      calculate_noise(blanks_data()[[i]], approach =  as.numeric(input$approach),
+                      confidence_level =  input$confidence_level,
+                      MDL_level =  input$MDL_level) 
+     
+    }) %>% rbindlist()
     
-    names(processed_samples) <- names(sample_list)
+
+     MDL_master <- MDL_master[order(-MDL), .SD[1], by = nominal_mass]
+     MDL_master[, MDL := round(MDL)]
     
-    # Export processed_samples to the global environment
-    assign("samples_MDL", processed_samples, envir = .GlobalEnv)
-    removeNotification(notification_id)
-    gc ()
+     progress1$close()
     
-    output$download_MDL<- downloadHandler(
-      filename = function() {
-        paste("Noise_cleaned_samples", Sys.Date(), ".rds", sep = "")
-      },
-      content = function(file) {
-        saveRDS(processed_samples, file)
-      }
-    )
+      #Initialize progress bar
+     progress2 <- Progress$new(session, min = 0, max = length(samples_data()))
+     on.exit(progress2$close())
     
-    processed_samples
+    
+    #  Process samples
+     processed_samples <- lapply(seq_along(samples_data()), function(i) {
+       progress2$set(value = i, message = "Processing samples", detail = paste0("Sample ", i, " of ", length(samples_data())))
+       sample <- samples_data()[[i]]
+       process_samples_MDL(
+         sample      = samples_data()[[i]],
+         MDL_master  = MDL_master,
+         input$remove_resolution_outliers
+       )
+    
+     })
+    
+     names(processed_samples) <- names(samples_data())
+     #progress2$close()
+     # Export processed_samples to the global environment
+     assign("samples_MDL", processed_samples, envir = .GlobalEnv)
+     gc ()
+
+     output$download_MDL<- downloadHandler(
+       filename = function() {
+         paste("Noise_cleaned_samples", Sys.Date(), ".rds", sep = "")
+       },
+       content = function(file) {
+         saveRDS(processed_samples, file)
+       }
+     )
+     removeNotification(notification_id)
+     
+     processed_samples
   })
   
   overview_data <- eventReactive(input$calculate, {
     req(samples_MDL())
-    sample_list <- samples_data()
-    processed_samples <- samples_MDL()
+    #sample_list <- samples_data()
+    #processed_samples <- samples_MDL()
     
     overview <- data.table(
-      Sample_Name = names(sample_list),
-      Rows_Before = sapply(sample_list, nrow),
-      Rows_After = sapply(processed_samples, nrow),
-      Min_mz = sapply(processed_samples, function(x) min(x$m.z, na.rm = TRUE)),
-      Max_mz = sapply(processed_samples, function(x) max(x$m.z, na.rm = TRUE))
+      Sample_Name = names(samples_data()),
+      Rows_Before = sapply(samples_data(), nrow),
+      Rows_After = sapply(samples_MDL(), nrow),
+      Min_mz = sapply(samples_MDL(), function(x) min(x$m.z, na.rm = TRUE)),
+      Max_mz = sapply(samples_MDL(), function(x) max(x$m.z, na.rm = TRUE))
     )
     
     return(overview)
   })
   
-  output$status <- renderPrint({
-    req(samples_MDL())
-    paste("Processing complete. Samples available in local environment", length(samples_MDL()), "samples.")
+  
+   # Render table for blanks_data head
+  output$blanks_preview <- renderTable({
+    req(blanks_data())
+    head(blanks_data()[[1]])
   })
+  
+  # Render table for samples_data head
+  output$samples_preview <- renderTable({
+    req(samples_data())
+    head(samples_data()[[1]])
+  })
+
+
+
   
   output$overview <- renderTable({
     req(overview_data())
@@ -487,79 +540,27 @@ mz_recalibration <- function(
     ion             = 1.007825032 + -1 * 0.00054857990907,
     S_MDL_limit     = 2,
     hom_member_min  = 2,
-    showplot = F
+    showplot = F,
+    samplename= ""
 ) {
-  SSE_1 <- NA
-  # 1) Subset only the columns you need from the original data to avoid carrying around large data:
-  #    If you still need all columns, remove the .() portion here.
+  SSE_1 <- 0
+  SSE_2 <- 0
+  plot <- plot_ly(type = "scatter", mode = "text",
+                  x = 1, y = 1, text = "Not enough points")%>%
+    layout(title = samplename, xaxis = list(title = "m/z"),
+           yaxis = list(title = "ppm"))
   
+
   
   data <- copy(spectrum)
   
   data_original <- copy (data)
   
-  # 2) Filter data by I / MDL > S_MDL_limit directly
-  data <- data[I / MDL > S_MDL_limit]
-  
-  # 3) Assign formulas and filter by atomic composition
-  out <- formula_assignment_multi_intensity(
-    formulas,
-    data,
-    ppm_tolerance = ppm_tolerance,
-    ion           = ion,
-    threshold = 200,
-    delete_singlets = F,
-    delete_MF_without_connection = F
-  )
-  out[, homologues_membership := NULL]
-  
-  # 4) Homologue-series calculation only if we still have enough data
-  if (nrow(out) > 20) {
-    out <- calculate_connections(out)[homologues_membership >= hom_member_min]
-  }
-  
-  # 5) If the filtered data is still sufficiently large, proceed with outlier filtering + GAM model
-  if (nrow(out) > 20) {
+  tryCatch({
     
-    # -- Quantile-based filtering in data.table style
-    Q1   <- quantile(out$ppm, 0.25)
-    Q3   <- quantile(out$ppm, 0.75)
-    IQRv <- Q3 - Q1
-    out  <- out[ppm > (Q1 - 1.5 * IQRv) & ppm < (Q3 + 1.5 * IQRv)]
     
-    SSE_1 <- round(sum(out$ppm^2),2)
-    
-    # -- Fit a GAM model
-    gam_model <- gam(ppm ~ s(m.z, bs = "cs", k = 4), data = out)
-    plot(gam_model)
-    # -- Use in-place correction on data_original
-    #    This avoids creating a separate temporary data.table.
-    data_original[, predicted_drift_ppm :=
-                    predict(gam_model, newdata = .SD),
-                  .SDcols = "m.z"]
-    data_original[, m.z :=
-                    m.z * (1 + predicted_drift_ppm / 1e6)]
-    # Optionally remove the predicted_drift_ppm column
-    
-  } else {
-   # message(paste0(data$index[1], " Not enough points"))
-  }
-  
- # message(paste0("Finished ", data$index[1]))
-  plot <- plot_ly()
-  SSE_2 <- NA
-  if(showplot & nrow(out) > 20){
-    plot1 <- plot_ly() %>%
-      
-      add_trace(data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
-                marker = list(color = 'grey', size = 5), name = paste0("SSE before: ",SSE_1)) %>%
-      add_trace(data = data_original, x = ~m.z, y = ~predicted_drift_ppm, type = 'scatter', mode = 'lines',
-                line = list(color = 'red', width = 2), name = 'GAM Model') %>%
-      layout(title = "placeholder", xaxis = list(title = "m/z", range=c(min(out$m.z),max(out$m.z))),
-             yaxis = list(title = "ppm", range=c(-ppm_tolerance,ppm_tolerance)))
-    
-    #repeat assignment
-    data <- data_original[I / MDL > S_MDL_limit]
+    # 2) Filter data by I / MDL > S_MDL_limit directly
+    data <- data[I / MDL > S_MDL_limit]
     
     # 3) Assign formulas and filter by atomic composition
     out <- formula_assignment_multi_intensity(
@@ -573,30 +574,92 @@ mz_recalibration <- function(
     )
     out[, homologues_membership := NULL]
     
+    # 4) Homologue-series calculation only if we still have enough data
+    if (nrow(out) > 20) {
+      out <- calculate_connections(out)[homologues_membership >= hom_member_min]
+    }
     
-    out <- calculate_connections(out)[homologues_membership >= hom_member_min]
-    
-    
-    # -- Quantile-based filtering in data.table style
-    Q1   <- quantile(out$ppm, 0.25)
-    Q3   <- quantile(out$ppm, 0.75)
-    IQRv <- Q3 - Q1
-    out  <- out[ppm > (Q1 - 1.5 * IQRv) & ppm < (Q3 + 1.5 * IQRv)]
-    SSE_2 <- round(sum(out$ppm^2),2)
-    
-    plot2 <- plot_ly() %>%
+    # 5) If the filtered data is still sufficiently large, proceed with outlier filtering + GAM model
+    if (nrow(out) > 20) {
       
-      add_trace(data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
-                marker = list(color = 'black', size = 5), name = paste0("SSE after: ",SSE_2)) %>%
+      # -- Quantile-based filtering in data.table style
+      Q1   <- quantile(out$ppm, 0.25)
+      Q3   <- quantile(out$ppm, 0.75)
+      IQRv <- Q3 - Q1
+      out  <- out[ppm > (Q1 - 1.5 * IQRv) & ppm < (Q3 + 1.5 * IQRv)]
       
-      layout(title = "placeholder", xaxis = list(title = "m/z", range=c(min(out$m.z),max(out$m.z))), yaxis = list(title = "ppm"))
+      SSE_1 <- round(sum(out$ppm^2),2)
+      
+      # -- Fit a GAM model
+      gam_model <- gam(ppm ~ s(m.z, bs = "cs", k = 4), data = out)
+      plot(gam_model)
+      # -- Use in-place correction on data_original
+      #    This avoids creating a separate temporary data.table.
+      data_original[, predicted_drift_ppm :=
+                      predict(gam_model, newdata = .SD),
+                    .SDcols = "m.z"]
+      data_original[, m.z :=
+                      m.z * (1 + predicted_drift_ppm / 1e6)]
+      # Optionally remove the predicted_drift_ppm column
+      
+    } else {
+    }
     
+
+    if(showplot & nrow(out) > 20){
+      plot1 <- plot_ly() %>%
+        
+        add_trace(data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
+                  marker = list(color = 'grey', size = 5), name = paste0("SSE before: ",SSE_1)) %>%
+        add_trace(data = data_original, x = ~m.z, y = ~predicted_drift_ppm, type = 'scatter', mode = 'lines',
+                  line = list(color = 'red', width = 2), name = 'GAM Model') %>%
+        layout(title = samplename, xaxis = list(title = "m/z", range=c(min(out$m.z),max(out$m.z))),
+               yaxis = list(title = "ppm", range=c(-ppm_tolerance,ppm_tolerance)))
+      
+      #repeat assignment
+      data <- data_original[I / MDL > S_MDL_limit]
+      
+      # 3) Assign formulas and filter by atomic composition
+      out <- formula_assignment_multi_intensity(
+        formulas,
+        data,
+        ppm_tolerance = ppm_tolerance,
+        ion           = ion,
+        threshold = 200,
+        delete_singlets = F,
+        delete_MF_without_connection = F
+      )
+      out[, homologues_membership := NULL]
+      
+      
+      out <- calculate_connections(out)[homologues_membership >= hom_member_min]
+      
+      
+      # -- Quantile-based filtering in data.table style
+      Q1   <- quantile(out$ppm, 0.25)
+      Q3   <- quantile(out$ppm, 0.75)
+      IQRv <- Q3 - Q1
+      out  <- out[ppm > (Q1 - 1.5 * IQRv) & ppm < (Q3 + 1.5 * IQRv)]
+      SSE_2 <- round(sum(out$ppm^2),2)
+      
+      plot2 <- plot_ly() %>%
+        
+        add_trace(data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
+                  marker = list(color = 'black', size = 5), name = paste0("SSE after: ",SSE_2)) %>%
+        
+        layout(title = samplename, xaxis = list(title = "m/z", range=c(min(out$m.z),max(out$m.z))), yaxis = list(title = "ppm"))
+      
+      
+      plot <- subplot(plot1, plot2, shareY = T, titleX = T, titleY = T)
+      
+      
+    }
+    gc()
     
-    plot <- subplot(plot1, plot2, shareY = T, titleX = T, titleY = T)
-    
-    
-  }
-  gc()
+    }, error = function(e) {
+    print(paste0("Error in Sample: ",samplename, ". Original data returned"))
+  })
+
   return(list(data =data_original[, .(m.z, I, MDL)],
               plot = plot,
               SSE_1 = SSE_1,
@@ -652,13 +715,15 @@ panel3_server <- function(input, output, session) {
     formulas_calibration <- generate_formulas(C_range = 2:50, H_range = 2:100, O_range = 1:20,
                                               P_range = 0:0, N_range = 0:1, S_range = 0:1,
                                               HC= c(1,2), OC = c(0.2,0.8), mass_range = c(100, 1000), insert_isotopes = T)
+    sample_names <- names(local_samples)
     out_list <- lapply(seq_along(local_samples), function(i) {
       progress$set(value = i, message = "Processing samples", detail = paste0("Sample ", i, " of ", length(local_samples)))
+      
       mz_recalibration(formulas_calibration, local_samples[[i]],
                        ppm_tolerance = input$ppm_tolerance,
                        S_MDL_limit = input$S_MDL_limit,
                        hom_member_min = input$hom_member_min,
-                       showplot = TRUE)
+                       showplot = TRUE, samplename = sample_names[i])
     })
     recal_data(out_list)
     out_data <- lapply(out_list, function(x){x$data})
@@ -1163,6 +1228,7 @@ formula_assignment_multi_intensity <- function(
   
   all_matches <- NULL
   # 1) Isotope peak verification
+  #automatically removes peaks where the main isotope intensity is below isotope peak intensity
   filtered_matches <- calculate_isotopes(filtered_matches, dat = dat)
   
   # 2) Homologous series calculation
@@ -1411,7 +1477,7 @@ panel5_server <- function(input, output, session) {
 # Then define one server that calls each panel’s server function within its own scope.
 
 ui <- navbarPage(
-  title = "Formula Asssigner",
+  title = "Formula Assigner",
   
   tabPanel(
     "MDL",
@@ -1446,6 +1512,10 @@ server <- function(input, output, session) {
   callModule(module = panel3_server, id = NULL)
   callModule(module = panel4_server, id = NULL)
   callModule(module = panel5_server, id = NULL)
+  
+  session$onSessionEnded(function() {
+    stopApp()
+  })
 }
 
 # Launch the unified Shiny app
