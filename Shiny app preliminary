@@ -55,11 +55,11 @@ calculate_noise <- function(blank, approach=1, confidence_level = 0.998, MDL_lev
 
 # Function to remove outliers in ResPow based on quantile regression
 ResPow_outlier <- function(dataset, showplot = F) {
-  #colnames(dataset)[1] <- "m.z"
+  colnames(dataset)[1] <- "m.z"
 
   nrow_initial <- nrow(dataset)
   
-  sample[, Res. := as.numeric(Res.)]
+  dataset[, Res. := as.numeric(Res.)]
   
   #dataset <- na.omit(dataset, cols = c("Res.", "m.z"))
   
@@ -226,7 +226,6 @@ panel1_server <- function(input, output, session) {
                       MDL_level =  input$MDL_level) 
      
     }) %>% rbindlist()
-    
 
      MDL_master <- MDL_master[order(-MDL), .SD[1], by = nominal_mass]
      MDL_master[, MDL := round(MDL)]
