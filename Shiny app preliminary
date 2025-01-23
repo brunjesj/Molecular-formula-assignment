@@ -912,20 +912,11 @@ isotope_deviance <- function(intensity_parent, intensity_child,
   ratio <- intensity_child / intensity_parent
   
   # Weighted mean of ratio, then scaled relative to expected_intensity_ratio
-  rdeviance_weighted <- ((weighted.mean(ratio, intensity_parent, na.rm = TRUE) /
-                            expected_intensity_ratio) - 1) * 1000
-  return(round(rdeviance_weighted))
+  rdeviance <- ((ratio / expected_intensity_ratio) - 1) * 1000
+  return(round(rdeviance))
 }
 
-# Compute a formula string from element counts
-construct_formula <- function(elements) {
-  # e.g., elements = list(C=6, H=12, O=6, ...)
-  # each gets turned into "C6", "H12", etc., omitting the number if == 1
-  formula_parts <- paste0(names(elements),
-                          ifelse(elements == 1, "", elements))
-  formula <- paste(formula_parts[elements > 0], collapse = "")
-  return(formula)
-}
+
 
 # Identify group connections for a single group
 calculate_group_connections <- function(dt_group, diffs) {
@@ -978,149 +969,7 @@ calculate_group_connections <- function(dt_group, diffs) {
 
 # --- Main Functions ---
 
-# Main function: calculate isotopes
-calculate_isotopes <- function(filtered_matches, dataset) {
-  
-  # Identify intensity columns
-  intensity_cols <- setdiff(
-    names(dataset),
-    c("m.z", "MDL", "SE", "m.z_ion", "index")
-  )
-  
-  # Compute combined intensities (rowMeans if >1 column, or single column)
-  if (length(intensity_cols) > 1) {
-    intensities <- dataset[, .(m.z, intensities = rowMeans(.SD, na.rm = TRUE)),
-                           .SDcols = intensity_cols]
-  } else {
-    intensities <- dataset[, .(m.z, intensities = get(intensity_cols))]
-  }
-  
-  # Merge intensities into filtered_matches
-  filtered_matches <- merge(filtered_matches, intensities,
-                            by.x = "m.z", by.y = "m.z", all.x = TRUE)
-  
-  # Split into parent vs. child isotopes
-  parent_all    <- filtered_matches[C_13 == 0 & O_18 == 0 & S_34 == 0]
-  child_C_1_all <- filtered_matches[C_13 == 1 & O_18 == 0 & S_34 == 0]
-  child_C_2_all <- filtered_matches[C_13 == 2 & O_18 == 0 & S_34 == 0]
-  child_O_all   <- filtered_matches[C_13 == 0 & O_18 == 1 & S_34 == 0]
-  child_S_all   <- filtered_matches[C_13 == 0 & O_18 == 0 & S_34 == 1]
-  
-  # Merge parent and child sets
-  result_C1 <- merge(
-    parent_all, child_C_1_all,
-    by = c("C", "H", "O", "N", "S", "P"),
-    suffixes = c("_parent", "_child")
-  )
-  result_C2 <- merge(
-    parent_all, child_C_2_all,
-    by = c("C", "H", "O", "N", "S", "P"),
-    suffixes = c("_parent", "_child")
-  )
-  result_O <- merge(
-    parent_all, child_O_all,
-    by = c("C", "H", "O", "N", "S", "P"),
-    suffixes = c("_parent", "_child")
-  )
-  result_S <- merge(
-    parent_all, child_S_all,
-    by = c("C", "H", "O", "N", "S", "P"),
-    suffixes = c("_parent", "_child")
-  )
-  
-  # Filter out lines where parent intensity <= child intensity
-  result_C1 <- result_C1[intensities_parent > intensities_child]
-  result_C2 <- result_C2[intensities_parent > intensities_child]
-  result_O  <- result_O[intensities_parent > intensities_child]
-  result_S  <- result_S[intensities_parent > intensities_child]
-  
-  # Calculate isotope deviance in each group, row by row
-  col_parent <- "intensities_parent"
-  col_child  <- "intensities_child"
-  
-  result_C1[, isotope_deviance_C_13_1 := isotope_deviance(
-    as.numeric(get(col_parent)),
-    as.numeric(get(col_child)),
-    number_of_atoms = C,
-    q = 0.0108,
-    p = 1 - 0.0108,
-    number_of_isotopes = 1
-  ), by = seq_len(nrow(result_C1))]
-  
-  result_C2[, isotope_deviance_C_13_2 := isotope_deviance(
-    as.numeric(get(col_parent)),
-    as.numeric(get(col_child)),
-    number_of_atoms = C,
-    q = 0.0108,
-    p = 1 - 0.0108,
-    number_of_isotopes = 2
-  ), by = seq_len(nrow(result_C2))]
-  
-  result_O[, isotope_deviance_O_18 := isotope_deviance(
-    as.numeric(get(col_parent)),
-    as.numeric(get(col_child)),
-    number_of_atoms = O,
-    q = 0.00205,
-    p = 1 - 0.00205,
-    number_of_isotopes = 1
-  ), by = seq_len(nrow(result_O))]
-  
-  result_S[, isotope_deviance_S_34 := isotope_deviance(
-    as.numeric(get(col_parent)),
-    as.numeric(get(col_child)),
-    number_of_atoms = S,
-    q = 0.0437,
-    p = 1 - 0.0437,
-    number_of_isotopes = 1
-  ), by = seq_len(nrow(result_S))]
-  
-  
-  # 1) Identify columns with '_parent' or '_child'
-  #    (do this once; assume each "result_X" has consistent column naming)
-  parent_cols <- grep("_parent$", names(result_C1), value = TRUE)
-  child_cols  <- grep("_child$",  names(result_C1), value = TRUE)
-  
-  # 2) Common columns in your data
-  common_cols <- c("C", "H", "O", "N", "S", "P")
-  
-  # 3) For each merged result (C1, C2, O, S), create a 'parent' table and 'child' table
-  #    removing the 'intensities' column in each subset to avoid duplication.
-  #    Then rename columns to remove _parent and _child suffixes for clarity.
-  split_and_rename <- function(dt, iso_col) {
-    dt_parent <- dt[, c(common_cols, parent_cols, iso_col), with = FALSE]
-    dt_child  <- dt[, c(common_cols, child_cols,  iso_col), with = FALSE]
-    
-    setnames(dt_parent, gsub("_parent$", "", names(dt_parent)))
-    setnames(dt_child,  gsub("_child$",  "", names(dt_child)))
-    
-    # Remove 'intensities' column in each subset if present
-    if ("intensities" %in% names(dt_parent)) dt_parent[, intensities := NULL]
-    if ("intensities" %in% names(dt_child))  dt_child[, intensities := NULL]
-    
-    return(list(parent = dt_parent, child = dt_child))
-  }
-  
-  pc_C1 <- split_and_rename(result_C1, "isotope_deviance_C_13_1")
-  pc_C2 <- split_and_rename(result_C2, "isotope_deviance_C_13_2")
-  pc_O  <- split_and_rename(result_O,  "isotope_deviance_O_18")
-  pc_S  <- split_and_rename(result_S,  "isotope_deviance_S_34")
-  
-  
-  by_child <- names(pc_C1$child)[-ncol(pc_C1$child)]
-  
-  isotopes <- merge(pc_C1$child, pc_C2$child, by = by_child, all = TRUE)
-  isotopes <- merge(isotopes, pc_O$child, by = by_child, all = TRUE)
-  isotopes <- merge(isotopes, pc_S$child, by = by_child, all = TRUE)
-  
-  
-  if ("intensities" %in% names(parent_all)) {
-    parent_all[, intensities := NULL]
-  }
-  
-  # Combine 'parent_all' with all isotopes
-  gc()
-  return(rbind(parent_all, isotopes, fill = TRUE))
-}
+
 
 # Calculate homologous connections 
 calculate_connections <- function(dt, diffs = list(
@@ -1166,9 +1015,6 @@ calculate_connections <- function(dt, diffs = list(
 }
 
 # Main formula assignment that calls the above functions
-#areas for improvement
-#keep intensities in the main all_matches to not have to merge mz and intensities
-#multiple times (for isotopes and then again later for returning the data)
 formula_assignment_multi_intensity <- function(
     formulas, dataset, ppm_tolerance = 0.5,
     ion = 1.007825032 + -1 * 0.00054857990907,
@@ -1179,7 +1025,23 @@ formula_assignment_multi_intensity <- function(
       H   = c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
     )
 ) {
+  
   dat <- copy(dataset) #create a clean copy to remove referencing to old dataset
+  
+  # Get the column names of of the samples
+  exclude_cols <- c("m.z", "MDL", "m.z_ion", "C", "H", "O", "N", "S", "P",
+                    "C_13", "O_18", "S_34", "calculated_m.z", "absolute_error", "ppm", "MF",
+                    "SE","predicted_drift_ppm", "present_in")
+  
+  int_cols <- setdiff(colnames(dat), exclude_cols)
+  
+  dat[, present_in := rowSums(!is.na(.SD)), .SDcols = int_cols]
+  
+  
+  # Delete singlets if chosen
+  if (delete_singlets) {
+    dat <- dat[present_in > 1]
+  }
   
   # Adjust m.z by the chosen ion mass
   dat[, m.z_ion := m.z]
@@ -1203,78 +1065,165 @@ formula_assignment_multi_intensity <- function(
     type = "within", nomatch = 0
   )
   dat[, c("lower_limit", "upper_limit") := NULL]
-  
-
+  #calculate the errors
   
   all_matches[, absolute_error := calculated_m.z - m.z]
   all_matches[, ppm := round(((absolute_error / m.z) * 1e6),3)]
   all_matches[, absolute_error := round(absolute_error,6)]
   
+  all_matches[, c("lower_limit", "upper_limit", "start", "end") := NULL]
   
-  filtered_matches <- data.table()
-  # Retain only columns of interest
-  filtered_matches <- all_matches[, .SD, .SDcols = c(
-    "m.z_ion", "m.z", "calculated_m.z", "absolute_error", "ppm",
-    "C", "H", "O", "N", "S", "P", "C_13", "O_18", "S_34"
+  #construct the formula
+  
+  all_matches[, MF := paste0(
+    ifelse(C > 1, paste0("C", C), ifelse(C == 1, "C", "")),
+    ifelse(H > 1, paste0("H", H), ifelse(H == 1, "H", "")),
+    ifelse(O > 1, paste0("O", O), ifelse(O == 1, "O", "")),
+    ifelse(N > 1, paste0("N", N), ifelse(N == 1, "N", "")),
+    ifelse(S > 1, paste0("S", S), ifelse(S == 1, "S", "")),
+    ifelse(P > 1, paste0("P", P), ifelse(P == 1, "P", ""))
   )]
   
-  all_matches <- NULL
-  # 1) Isotope peak verification
-  #automatically removes peaks where the main isotope intensity is below isotope peak intensity
+  #remove isotope formulas where no parent is present
+  all_matches <- all_matches[
+    !(C_13 > 0 | O_18 > 0 | S_34 > 0) | 
+      (duplicated(MF) | duplicated(MF, fromLast = TRUE))
+  ]
   
-  #this could wrongly delete isotope formulas in case of multiple intensities in a crosstab,
-  #where the mean intensities are compared.
-  filtered_matches <- calculate_isotopes(filtered_matches, dat = dat)
   
-  # 2) Homologous series calculation
-  filtered_matches <- calculate_connections(filtered_matches, diffs = homologues_network)
-  filtered_matches[, index := NULL]
+  #for the rare case that a merged samplelist contains the same MF with two different masses
+  #will select the one with more hits
+  setorder(all_matches, MF, -present_in)
   
-  # Threshold test
-  filtered_matches[, isotope_below_threshold := (
-    isotope_deviance_C_13_1 < threshold |
-      isotope_deviance_C_13_2 < threshold |
-      isotope_deviance_O_18   < threshold |
-      isotope_deviance_S_34   < threshold
+  #this appears to be neccessary to make the new column numeric; else if will be logical and the deviance function cannot write into this column
+  all_matches[, isotope_deviance_C_13_1 := 1]
+  all_matches[, isotope_deviance_C_13_2 := 1]
+  all_matches[, isotope_deviance_O_18 := 1]
+  all_matches[, isotope_deviance_S_34 := 1]
+  
+  #calculation of isotope deviances
+  
+#if multiple samples are present, take the median
+  #this can introduce error.
+  all_matches[, median_intensity := apply(.SD, 1, median, na.rm = TRUE), .SDcols = int_cols]
+  
+  all_matches[, isotope_deviance_C_13_1 := {
+    parent <- median_intensity[C_13 == 0][1] 
+    child <- median_intensity[C_13 == 1][1]# %>% mean()
+    if (length(parent) > 0 & length(child > 0)) {
+      isotope_deviance(
+        parent,
+        child,
+        number_of_atoms = C[1],
+        q = 0.0108,
+        p = 1 - 0.0108,
+        number_of_isotopes = 1
+      )
+    } else {NA}
+  }, by = MF]
+  
+  all_matches[, isotope_deviance_C_13_2 := {
+    parent <- median_intensity[C_13 == 0] [1]
+    child <- median_intensity[C_13 == 2] [1]
+    if (length(parent) > 0 & length(child > 0)) {
+      isotope_deviance(
+        parent,
+        child,
+        number_of_atoms = C[1],
+        q = 0.0108,
+        p = 1 - 0.0108,
+        number_of_isotopes = 2
+      )
+    } else {NA}
+  }, by = MF]
+  
+  all_matches[, isotope_deviance_O_18 := {
+    parent <- median_intensity[O_18 == 0] [1]
+    child <- median_intensity[O_18 == 1] [1]
+    if (length(parent) > 0 & length(child > 0)) {
+      isotope_deviance(
+        parent,
+        child,
+        number_of_atoms = O[1],
+        q = 0.00205,
+        p = 1 - 0.00205,
+        number_of_isotopes = 1
+      )
+    } else {NA}
+  }, by = MF]
+  
+  all_matches[, isotope_deviance_S_34 := {
+    parent <- median_intensity[S_34 == 0][1] 
+    child <- median_intensity[S_34 == 1] [1]
+    if (length(parent) > 0 & length(child > 0)) {
+      isotope_deviance(
+        parent,
+        child,
+        number_of_atoms = S[1],
+        q = 0.0437,
+        p = 1 - 0.0437,
+        number_of_isotopes = 1
+      )
+    } else {NA}
+  }, by = MF]
+  
+  all_matches[, median_intensity := NULL]
+  
+  # Remove rows where C_13 == 2 and isotope_deviance_C_13_1 is NaN, e.g. no C13_1 peak present
+  all_matches <- all_matches[!(C_13 == 2 & is.nan(isotope_deviance_C_13_1))]
+  
+  # Threshold test column
+  all_matches[, isotope_below_threshold := (
+    (isotope_deviance_C_13_1 < threshold ) |
+      (isotope_deviance_C_13_2 < threshold )|
+      (isotope_deviance_O_18 < threshold )|
+      (isotope_deviance_S_34 < threshold ) 
   )]
   
   # Return only best match per measured m/z if requested
   if (return_likeliest) {
-    filtered_matches[, abs_ppm := abs(ppm)]
+    #remove isotope formulas below threshold
+    all_matches <- all_matches[!(
+      (isotope_deviance_C_13_1 > threshold & C_13 == 1) |
+        (isotope_deviance_C_13_2 > threshold & C_13 == 2)|
+        (isotope_deviance_O_18 > threshold & O_18 == 1)|
+        (isotope_deviance_S_34 > threshold & S_34 == 1)
+    )]
+    
+    # 2) Homologous series calculation
+    all_matches <- calculate_connections(all_matches, diffs = homologues_network)
+    
+    
+    all_matches[, abs_ppm := abs(ppm)]
     #sort by isotope verified, number of homologues connections and smallest error
-    setorder(filtered_matches, m.z, -isotope_below_threshold,
+    setorder(all_matches, m.z, -isotope_below_threshold,
              -homologues_membership, abs_ppm)
     #returns only 1 match per unique mz
-    filtered_matches <- filtered_matches[, .SD[1], by = m.z]
-    filtered_matches[, c("abs_ppm", "homologues_membership") := NULL]
+    all_matches <- all_matches[, .SD[1], by = m.z]
+    all_matches[, c("abs_ppm", "homologues_membership") := NULL]
     
-    # Keep only isotopes with deviance below threshold
-    filtered_matches <- subset(filtered_matches,
-                               (C_13 == 0 | isotope_below_threshold == TRUE) &
-                                 (O_18 == 0 | isotope_below_threshold == TRUE) &
-                                 (S_34 == 0 | isotope_below_threshold == TRUE)
-    )
     
     # Recompute connections
-    filtered_matches <- calculate_connections(
-      filtered_matches, diffs = homologues_network
+    all_matches <- calculate_connections(
+      all_matches, diffs = homologues_network
     )
+    
+  } else{
+    # 2) Homologous series calculation
+    all_matches <- calculate_connections(all_matches, diffs = homologues_network)
+    
   }
   
-  # 3) Construct molecular formula and compute other metrics
-  filtered_matches[, MF := construct_formula(
-    list(C = C, H = H, O = O, N = N, S = S, P = P)
-  ), by = 1:nrow(filtered_matches)]
-  
-  filtered_matches <- filtered_matches[, `:=`(
-    O.C = round(O/C,2), H.C = round(O/C,2), N.C = round(N/C,2), S.C = round(S/C,2), P.C = round(P/C,2), 
+  #add additional columns with indices
+  all_matches <- all_matches[, `:=`(
+    O.C = round(O/C,2), H.C = round(H/C,2), N.C = round(N/C,2), S.C = round(S/C,2), P.C = round(P/C,2), 
     AI_mod =  round(pmax(0, (1 + C - 0.5 * O - S - 0.5 * (H + N + P)) / (C - 0.5 * O - S - N - P)),2),
     NOSC = round(((-(4*C + H - 3*N - 2*O + 5*P - 2*S) / C) + 4),2),
     DBE    = 1 + (2 * C - H + N + P) / 2
   )][AI_mod <= 1]
   
   # Simple classification
-  filtered_matches[, class := fifelse(
+  all_matches[, class := fifelse(
     H.C >= 2 , "Saturated",
     fifelse(
       H.C >= 1.5 & H.C < 2 , "Unsaturated Aliphatic",
@@ -1292,61 +1241,32 @@ formula_assignment_multi_intensity <- function(
     
   )]
   
-  # Reorder/filter columns
+  
+  # Possibly delete MF without a homologous connection
+  if (delete_MF_without_connection) {
+    all_matches <- all_matches[homologues_membership > 1]
+  }
+  
+  #return and custom order of columns
+  
   filter_cols <- c(
     "m.z_ion", "m.z", "calculated_m.z", "absolute_error", "ppm", "MF",
     "group", "class", "C", "H", "O", "N", "S", "P", "C_13", "O_18", "S_34",
     "H.C", "O.C", "N.C", "S.C", "P.C", "AI_mod", "NOSC","DBE", "homologues_membership",
     "isotope_deviance_C_13_1", "isotope_deviance_C_13_2",
-    "isotope_deviance_O_18", "isotope_deviance_S_34", "isotope_below_threshold"
+    "isotope_deviance_O_18", "isotope_deviance_S_34", "isotope_below_threshold","present_in","MDL", int_cols
   )
-  filtered_matches <- filtered_matches[, ..filter_cols]
-  
-  # Merge original dat columns back in and track presence
-  dat[, m.z := NULL]
-  filtered_matches <- merge(filtered_matches, dat, 
-                            by.x = "m.z_ion", by.y = "m.z_ion", all.x = TRUE)
-  
-  selected_cols <- setdiff(names(filtered_matches), filter_cols) # Remove filter_cols
-  selected_cols <- selected_cols[!grepl("SE|MDL|predicted_drift_ppm", selected_cols)] # Exclude columns containing "SE" or "MDL"
+  all_matches <- all_matches[, ..filter_cols]
+  setorder(all_matches, m.z)
   
   
-  filtered_matches[, present_in := rowSums(!is.na(.SD)), .SDcols = selected_cols]
-  
-  
-  # Move `present_in` column to just after the filter_cols
-  filter_col_names <- c(names(filtered_matches)[1:length(filter_cols)], "present_in", "MDL")
-  setcolorder(filtered_matches, c(filter_col_names,setdiff(names(filtered_matches),
-                                                           c(filter_col_names))))
-  
-  
-  # Delete singlets if chosen
-  if (delete_singlets) {
-    filtered_matches <- subset(filtered_matches, present_in > 1)
-  }
-  
-  # Possibly delete MF without a homologous connection
-  if (delete_MF_without_connection) {
-    # Recalculate homologues membership after removing singlets
-    if (delete_singlets) {
-      temp <- copy(filtered_matches)
-      temp[, homologues_membership := NULL]
-      filtered_matches$homologues_membership <- calculate_connections(
-        temp, diffs = homologues_network
-      )$homologues_membership
-    }
-    filtered_matches <- subset(filtered_matches, homologues_membership > 1)
-    temp <- NULL
-  }
-  
-  setorder(filtered_matches, m.z)
   dat <- NULL
   formulas[, start := NULL]
   formulas[, end := NULL]
   
   
   gc()
-  return(filtered_matches)
+  return(all_matches)
 }
 
 
