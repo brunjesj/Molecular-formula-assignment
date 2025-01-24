@@ -14,23 +14,16 @@ library(plotly)
 library(mgcv)
 library(igraph)
 
-###############################################################################
-#               Panel 1:  Functions & Shiny UI/Server Code                    #
-#                    (Instrument Blanks Noise Removal)                    #
-###############################################################################
-
-# -- Panel 1 Functions --
-# Set maximum file size (adjust as needed)
-options(shiny.maxRequestSize = 4096 * 4096 * 4096)
+#functions
 
 calculate_noise <- function(blank, approach=1, confidence_level = 0.998, MDL_level = 2.5){
   colnames(blank)[1] <- "m.z"
   colnames(blank)[2] <- "I"
   blank[, I := as.numeric(I)]
   blank[, m.z := as.numeric(m.z)]
-
+  
   blank[, nominal_mass := floor(m.z + 0.5)]
-
+  
   if (approach == 1) {
     # Use Riedel-based formula (t-statistic with user-defined confidence level)
     res <- blank[, .(
@@ -56,7 +49,7 @@ calculate_noise <- function(blank, approach=1, confidence_level = 0.998, MDL_lev
 # Function to remove outliers in ResPow based on quantile regression
 ResPow_outlier <- function(dataset, showplot = F) {
   colnames(dataset)[1] <- "m.z"
-
+  
   nrow_initial <- nrow(dataset)
   
   dataset[, Res. := as.numeric(Res.)]
@@ -91,9 +84,9 @@ ResPow_outlier <- function(dataset, showplot = F) {
     plot <- plot %>% layout(xaxis = list(title = "m/z"), yaxis = list ( title = "Resolution"))
     print(plot)
   }
-
   
-
+  
+  
   # Return only rows whose residuals are within ±e
   dataset <-dataset[which(d$residuals <= abs(e))]
   nrow_after <- nrow(dataset)
@@ -112,7 +105,7 @@ process_samples_MDL <- function(sample, MDL_master, remove_resolution_outliers =
   colnames(sample)[2] <- "I"
   sample[, I := as.numeric(I)]
   sample[, m.z := as.numeric(m.z)]
-
+  
   
   
   #Calculate nominal_mz
@@ -138,6 +131,984 @@ process_samples_MDL <- function(sample, MDL_master, remove_resolution_outliers =
                                             .(m.z, I, MDL)]
   }
 }
+
+isotope_combinations <- function(formulas_dt, mass_range,
+                                 mass_C, mass_H, mass_O, mass_N, mass_S, mass_P) {
+  # Construct a grid for all possible isotopes (within the defined maxima).
+  isotope_grid <- CJ(
+    O_18 = 0:max(formulas_dt$max_O18),
+    C_13 = 0:max(formulas_dt$max_C13),
+    S_34 = 0:max(formulas_dt$max_S34)
+  )
+  
+  # Only keep relevant combinations:
+  #  - Single extra isotope (O_18, S_34, or C_13)
+  #    OR a double 13C (C_13 == 2) with no O_18 / S_34
+  isotope_grid <- isotope_grid[
+    (O_18 + S_34 + C_13 == 1) | (C_13 == 2 & O_18 == 0 & S_34 == 0)
+  ]
+  
+  # Expand the formula set
+  expanded_formulas <- formulas_dt[rep(seq_len(.N), each = nrow(isotope_grid))]
+  expanded_isotopes <- isotope_grid[rep(seq_len(nrow(isotope_grid)), times = formulas_dt[ , .N])]
+  combined_formulas <- cbind(expanded_formulas, expanded_isotopes)
+  
+  # Only valid if isotopes actually exist in the formula
+  combined_formulas <- combined_formulas[
+    (C_13 > 0 & O_18 == 0 & S_34 == 0) |
+      ((S_34 > 0 & S > 0) | (O_18 > 0 & O > 0))
+  ]
+  
+  # Recompute m/z for these isotopes
+  combined_formulas[ ,
+                     mz := C * mass_C + H * mass_H + O * mass_O + N * mass_N + S * mass_S + P * mass_P +
+                       C_13 * (13.00335540 - mass_C) +
+                       O_18 * (17.99915960 - mass_O) +
+                       S_34 * (33.96786690 - mass_S)
+  ]
+  
+  # Keep only those within the requested m/z range
+  combined_formulas[mz >= mass_range[1] & mz <= mass_range[2]]
+}
+
+
+generate_formulas <- function(C_range = 1:50, H_range = 2:120, O_range = 0:50,
+                              N_range = 0:4, S_range = 0:2, P_range = 0:1,
+                              mass_range = c(50, 1000), HC = c( 0.2, 3), OC = c(0, 1.2), insert_isotopes = T) {
+  
+  # Define element masses in one place
+  mass_C  <- 12
+  mass_H  <- 1.00782503
+  mass_O  <- 15.99491463
+  mass_N  <- 14.00307400
+  mass_S  <- 31.97207117
+  mass_P  <- 30.97376203
+  
+  # Create the grid of C, N, S, P and apply basic filters
+  dt <- CJ(C = C_range, N = N_range, S = S_range, P = P_range)[
+    C > 0 &
+      (N / C) <= 1.3 & (S / C) <= 0.8 & (P / C) <= 0.3 &
+      !(N > 1 & (S + P > 0)) &
+      !(N != 0 & S != 0 & P != 0) &
+      !(S + P > 2) &
+      !(N == 1 & (S > 1 | P > 1))
+  ]
+  
+  # Precompute min and max for H and O based on rules
+  dt[ , `:=`(
+    H_min = pmax(ceiling(HC[1] * C), H_range[1]),
+    H_max = pmin(floor(HC[2] * C), max(H_range)),
+    O_max = pmin(floor(OC[2] * C), max(O_range))
+  )]
+  
+  # Construct possible (H, O) combinations
+  results <- dt[ , {
+    if (H_min <= H_max) {
+      H_values <- H_min:H_max
+      O_values <- seq.int(0, O_max)
+      H_O_dt <- CJ(H = H_values, O = O_values)[
+        (H / C) >= HC[1] & (H / C) <= HC[2] & (O / C) >= OC[1] & (O / C) <= OC[2]
+      ]
+    } else {
+      H_O_dt <- NULL
+    }
+    H_O_dt
+  }, by = .(C, N, S, P)]
+  
+  # Compute DBE and valence, then subset
+  results[ , `:=`(
+    DBE    = 1 + (2 * C - H + N + P) / 2,
+    valence = C * 4 + H * 1 + O * 2 + N * 3 + S * 2 + P * 5
+  )]
+  results <- results[
+    DBE >= 0 & DBE %% 1 == 0 &
+      valence %% 2 == 0
+  ][ , c("DBE", "valence") := NULL]  # drop columns right after filtering
+  
+  # Compute final m/z
+  results[ ,
+           mz := C * mass_C + H * mass_H + O * mass_O + N * mass_N + S * mass_S + P * mass_P
+  ]
+  results <- results[mz >= mass_range[1] & mz <= mass_range[2]]
+  
+  # Insert isotopes if needed
+  if (isTRUE(insert_isotopes)) {
+    results[ , `:=`(
+      max_O18 = pmin(1, O),
+      max_C13 = pmin(2, C),
+      max_S34 = pmin(1, S)
+    )]
+    
+    # Reuse the pre-defined function
+    results_isotopes <- isotope_combinations(
+      formulas_dt = results,
+      mass_range  = mass_range,
+      mass_C      = mass_C,
+      mass_H      = mass_H,
+      mass_O      = mass_O,
+      mass_N      = mass_N,
+      mass_S      = mass_S,
+      mass_P      = mass_P
+    )
+    results <- rbind(results, results_isotopes, use.names = TRUE, fill = TRUE)
+    
+  } else {
+    # If not inserting isotopes, fill with zeros
+    results[ , c("O_18", "C_13", "S_34") := 0]
+  }
+  
+  # Final columns, replace NAs, and sort
+  results <- results[ , .(
+    C, H, O, N, S, P,
+    C_13      = ifelse(is.na(C_13), 0, C_13),
+    O_18      = ifelse(is.na(O_18), 0, O_18),
+    S_34      = ifelse(is.na(S_34), 0, S_34),
+    calculated_m.z = round(mz,8)
+  )]
+  
+  setorder(results, calculated_m.z)
+  gc()
+  return(results)
+}
+
+
+# -- Panel 3 Functions --
+
+mz_recalibration <- function(
+    formulas,
+    spectrum,
+    ppm_tolerance   = 0.5,
+    ion             = 1.007825032 + -1 * 0.00054857990907,
+    S_MDL_limit     = 2,
+    hom_member_min  = 2,
+    showplot = F,
+    samplename= ""
+) {
+  SSE_1 <- 0
+  SSE_2 <- 0
+  plot <- plot_ly(type = "scatter", mode = "text",
+                  x = 1, y = 1, text = "Not enough points")%>%
+    layout(title = samplename, xaxis = list(title = "m/z"),
+           yaxis = list(title = "ppm"))
+  
+  
+  
+  data <- copy(spectrum)
+  
+  data_original <- copy (data)
+  
+  tryCatch({
+    
+    # 2) Filter data by I / MDL > S_MDL_limit 
+    data <- data[I / MDL > S_MDL_limit]
+    
+    # 3) Assign formulas 
+    out <- formula_assignment_multi_intensity(
+      formulas,
+      data,
+      ppm_tolerance = ppm_tolerance,
+      ion           = ion,
+      threshold = 500,
+      delete_singlets = F,
+      delete_MF_without_connection = F
+    )[homologues_membership >= hom_member_min]
+    
+    
+    # 5) If the filtered data is still sufficiently large, proceed with outlier filtering + GAM model
+    if (nrow(out) > 20) {
+      
+      # -- Quantile-based filtering in data.table style
+      #could also filter along the mz axis?
+      Q1   <- quantile(out$ppm, 0.25)
+      Q3   <- quantile(out$ppm, 0.75)
+      IQRv <- Q3 - Q1
+      out  <- out[ppm > (Q1 - 1.5 * IQRv) & ppm < (Q3 + 1.5 * IQRv)]
+      
+      #could also filter along the mz axis?
+      Q1   <- quantile(out$m.z, 0.25)
+      Q3   <- quantile(out$m.z, 0.75)
+      IQRv <- Q3 - Q1
+      out  <- out[m.z > (Q1 - 1.5 * IQRv) & m.z < (Q3 + 1.5 * IQRv)]
+      
+      
+      SSE_1 <- round(sum(out$ppm^2),2)
+      
+      # -- Fit a GAM model
+      gam_model <- gam(ppm ~ s(m.z, bs = "cs", k = 3), data = out)
+      #plot(gam_model)
+      
+      data_original[, predicted_drift_ppm :=
+                      predict(gam_model, newdata = .SD),
+                    .SDcols = "m.z"]
+      data_original[, m.z :=
+                      m.z * (1 + predicted_drift_ppm / 1e6)]
+      #data_original[, m.z := m.z * (1 + predict(gam_model, newdata = .SD, .SDcols = "m.z") / 1e6)]
+      
+      
+      
+    } else {
+    }
+    
+    
+    if(showplot & nrow(out) > 20){
+      plot1 <- plot_ly() %>%
+        
+        add_trace(data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
+                  marker = list(color = 'grey', size = 5), name = paste0("SSE before: ",SSE_1)) %>%
+        add_trace(data = data_original, x = ~m.z, y = ~predicted_drift_ppm, type = 'scatter', mode = 'lines',
+                  line = list(color = 'red', width = 2), name = 'GAM Model') %>%
+        layout(title = samplename, xaxis = list(title = "m/z", range=c(min(out$m.z),max(out$m.z))),
+               yaxis = list(title = "ppm", range=c(-ppm_tolerance,ppm_tolerance)))
+      
+      #repeat assignment
+      data <- data_original[I / MDL > S_MDL_limit]
+      
+      # 3) Assign formulas and filter by atomic composition
+      out <- formula_assignment_multi_intensity(
+        formulas,
+        data,
+        ppm_tolerance = ppm_tolerance,
+        ion           = ion,
+        threshold = 500,
+        delete_singlets = F,
+        delete_MF_without_connection = F
+      )[homologues_membership >= hom_member_min]
+      
+      
+      
+      
+      # -- Quantile-based filtering in data.table style
+      Q1   <- quantile(out$ppm, 0.25)
+      Q3   <- quantile(out$ppm, 0.75)
+      IQRv <- Q3 - Q1
+      out  <- out[ppm > (Q1 - 1.5 * IQRv) & ppm < (Q3 + 1.5 * IQRv)]
+      
+      #could also filter along the mz axis?
+      Q1   <- quantile(out$m.z, 0.25)
+      Q3   <- quantile(out$m.z, 0.75)
+      IQRv <- Q3 - Q1
+      out  <- out[m.z > (Q1 - 1.5 * IQRv) & m.z < (Q3 + 1.5 * IQRv)]
+      
+      
+      
+      SSE_2 <- round(sum(out$ppm^2),2)
+      
+      plot2 <- plot_ly() %>%
+        
+        add_trace(data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
+                  marker = list(color = 'black', size = 5), name = paste0("SSE after: ",SSE_2)) %>%
+        
+        layout(title = samplename, xaxis = list(title = "m/z", range=c(min(out$m.z),max(out$m.z))), yaxis = list(title = "ppm"))
+      
+      
+      plot <- subplot(plot1, plot2, shareY = T, titleX = T, titleY = T)
+      
+      
+    }
+    gc()
+    
+  }, error = function(e) {
+    print(paste0("Error in Sample: ",samplename, ". Original data returned"))
+  })
+  
+  return(list(data =data_original[, .(m.z, I, MDL)],
+              plot = plot,
+              SSE_1 = SSE_1,
+              SSE_2 = SSE_2))
+}
+
+# -- Panel 4 Functions --
+merge_mz_values <- function(dt, ppm_tolerance) {
+  
+  
+  # # Rename columns 
+  # setnames(dt, old = colnames(dt)[1], new = "mz")
+  # setnames(dt, old = colnames(dt)[3], new = "MDL")
+  
+  # Sort by m/z
+  
+  setorder(dt, m.z)
+  
+  # Compute difference in ppm between consecutive m/z
+  dt[, diff_ppm := (m.z - shift(m.z, type = "lag")) / shift(m.z, type = "lag") * 1e6]
+  # Replace the first NA with Inf (equivalent to c(Inf, diff(m.z))/m.z * 1e6)
+  dt[is.na(diff_ppm), diff_ppm := Inf]
+  
+  # Identify groups whose differences exceed ppm_tolerance
+  dt[, group := cumsum(diff_ppm > ppm_tolerance)]
+  
+  # Calculate the weighted mean m/z and other values 
+  merged <- dt[, {
+    sqrt_I <- sqrt(I)
+    sum_sqrt_I <- sum(sqrt_I)
+    .(
+      merged_m.z = sum(m.z * sqrt_I) / sum_sqrt_I,
+      mean_MDL  = MDL[1],            #MDL should be the same accross all samples.                   
+      SE        = round(sd(m.z) / (sum(m.z * sqrt_I) / sum_sqrt_I) * 1e6,5)
+    )
+  }, by = group]
+  
+  # Update-join  to add columns back
+  dt[merged, on = "group", `:=`(
+    merged_m.z = i.merged_m.z,
+    mean_MDL  = i.mean_MDL,
+    SE        = i.SE
+  )]
+  
+  # Remove duplicates by selecting the first row per group and index
+  dt2 <- dt[, .SD[1], keyby = .(group, index)]
+  
+  # Reshape to wide format; each index becomes a column
+  dt_wide <- dcast(
+    dt2,
+    merged_m.z + mean_MDL + SE ~ index,
+    value.var = "I",
+    fill = NA
+  )
+  
+  # Rename columns for the final output
+  setnames(dt_wide, old = c("merged_m.z", "mean_MDL"), new = c("m.z", "MDL"))
+  gc()
+  return(dt_wide)
+}
+
+
+# -- Panel 5 Functions --
+# Compute isotope deviance
+isotope_deviance <- function(intensity_parent, intensity_child,
+                             number_of_atoms, q, p, number_of_isotopes = 1) {
+  expected_intensity_ratio <- dbinom(number_of_isotopes, number_of_atoms, q) /
+    dbinom(number_of_atoms, number_of_atoms, p)
+  ratio <- intensity_child / intensity_parent
+  
+  # Weighted mean of ratio, then scaled relative to expected_intensity_ratio
+  rdeviance <- ((ratio / expected_intensity_ratio) - 1) * 1000
+  return(round(rdeviance))
+}
+
+
+
+# Identify group connections for a single group
+calculate_group_connections <- function(dt_group, diffs) {
+  
+  group_results <- lapply(names(diffs), function(diff_name){
+    diff_vector <- diffs[[diff_name]]
+    diff_dt <- dt_group[, .(
+      C = C + diff_vector["C"],
+      H = H + diff_vector["H"],
+      O = O + diff_vector["O"],
+      N = N + diff_vector["N"],
+      S = S + diff_vector["S"],
+      P = P + diff_vector["P"],
+      from_index = index
+    )]
+    
+    # Match the diff_dt to dt_group by the new formula
+    setkeyv(diff_dt, c("C", "H", "O", "N", "S", "P"))
+    setkeyv(dt_group, c("C", "H", "O", "N", "S", "P"))
+    
+    #the following can throw an error if allow.cartesian is not set to true.
+    #need to investigate the reason.
+    matched <- dt_group[diff_dt, nomatch = 0L, allow.cartesian = TRUE]
+    
+    if (nrow(matched) > 0) {
+      matched[, .(
+        from_index = from_index,
+        to_index = index,
+        connection_type = diff_name
+      )]
+      
+      
+    }
+  })
+  names(group_results) <- names(diffs)
+  
+  
+  # Combine all connections for this group
+  all_group_connections <- rbindlist(group_results, use.names = TRUE, fill = TRUE)
+  
+  # Tag any formula with no connections
+  no_connections <- dt_group[
+    !index %in% unique(c(all_group_connections$from_index, all_group_connections$to_index)),
+    .(from_index = index, to_index = NA, connection_type = "No Connection")
+  ]
+  all_group_connections <- rbind(all_group_connections, no_connections, fill = TRUE)
+  
+  return(all_group_connections)
+}
+
+# --- Main Functions ---
+
+
+
+# Calculate homologous connections 
+calculate_connections <- function(dt, diffs = list(
+  CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
+  H2   = c(C = 0, H = 2, O = 0, N = 0, S = 0, P = 0)
+)) {
+  
+  
+  # Group assignment
+  dt[, group := fifelse(N > 0 & P > 0, "NP",
+                        fifelse(N > 0 & (S > 0 | S_34 > 0), "NS",
+                                fifelse((S > 0 | S_34 > 0) & P > 0, "SP",
+                                        fifelse(N > 0 & S == 0 & P == 0 & S_34 == 0, "N",
+                                                fifelse((S > 0 | S_34 > 0) & N == 0 & P == 0, "S",
+                                                        fifelse(P > 0 & S == 0 & N == 0 & S_34 == 0, "P",
+                                                                fifelse(O > 0 & P == 0 & S == 0 & N == 0 & S_34 == 0, "CHO",
+                                                                        fifelse(O == 0 & P == 0 & S == 0 & N == 0 & S_34 == 0, "CH", "None"))))))))]
+  
+  # Calculate connections in each group
+  
+  setorder(dt, C, H, O)
+  dt[, index := .I]
+  
+  
+  all_connections <- lapply(unique(dt$group), function(grp){
+    dt_group <- dt[group == grp]
+    calculate_group_connections(dt_group, diffs)
+  }) %>% rbindlist(use.names = T, fill = T)
+  
+  
+  # Graph-based approach to membership
+  Ak <- igraph::graph_from_data_frame(all_connections[!is.na(to_index)], directed = FALSE) %>%
+    igraph::components()
+  membership_dt <- data.table(index = as.integer(names(Ak$membership)),
+                              homologues_membership = Ak$membership)
+  #sum up network members
+  membership_dt[, homologues_membership := .N, by = homologues_membership]
+  
+  out <- merge(dt, membership_dt, by = "index", all.x = TRUE)
+  out[is.na(homologues_membership), homologues_membership := 1]
+  
+  return(out)
+}
+
+# Main formula assignment that calls the above functions
+formula_assignment_multi_intensity <- function(
+    formulas, dataset, ppm_tolerance = 0.5,
+    ion = 1.007825032 + -1 * 0.00054857990907,
+    threshold = 1000, return_likeliest = TRUE,
+    delete_singlets = FALSE, delete_MF_without_connection = TRUE,
+    homologues_network = list(
+      CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
+      H2   = c(C = 0, H = 2, O = 0, N = 0, S = 0, P = 0)
+    )
+) {
+  
+  dat <- copy(dataset) #create a clean copy to remove referencing to old dataset
+  
+  # Get the column names of of the samples
+  exclude_cols <- c("m.z", "MDL", "m.z_ion", "C", "H", "O", "N", "S", "P",
+                    "C_13", "O_18", "S_34", "calculated_m.z", "absolute_error", "ppm", "MF",
+                    "SE","predicted_drift_ppm", "present_in")
+  
+  int_cols <- setdiff(colnames(dat), exclude_cols)
+  
+  dat[, present_in := rowSums(!is.na(.SD)), .SDcols = int_cols]
+  
+  
+  # Delete singlets if chosen
+  if (delete_singlets) {
+    dat <- dat[present_in > 1]
+  }
+  
+  # Adjust m.z by the chosen ion mass
+  dat[, m.z_ion := m.z]
+  dat[, m.z := m.z + ion]
+  
+  # Generate tolerance columns
+  dat[, `:=`(lower_limit = m.z * (1 - ppm_tolerance / 1e6),
+             upper_limit = m.z * (1 + ppm_tolerance / 1e6))]
+  
+  # Prepare formula data and set keys for overlap
+  formulas[, `:=`(start = calculated_m.z, end = calculated_m.z)]
+  setkey(formulas, start, end)
+  setkey(dat, lower_limit, upper_limit)
+  
+  all_matches <- data.table()
+  # Overlap join
+  all_matches <- foverlaps(
+    formulas, dat, 
+    by.x = c("start", "end"),
+    by.y = c("lower_limit", "upper_limit"),
+    type = "within", nomatch = 0
+  )
+  dat[, c("lower_limit", "upper_limit") := NULL]
+  #calculate the errors
+  
+  all_matches[, absolute_error := calculated_m.z - m.z]
+  all_matches[, ppm := round(((absolute_error / m.z) * 1e6),3)]
+  all_matches[, absolute_error := round(absolute_error,6)]
+  
+  all_matches[, c("lower_limit", "upper_limit", "start", "end") := NULL]
+  
+  #construct the formula
+  
+  all_matches[, MF := paste0(
+    ifelse(C > 1, paste0("C", C), ifelse(C == 1, "C", "")),
+    ifelse(H > 1, paste0("H", H), ifelse(H == 1, "H", "")),
+    ifelse(O > 1, paste0("O", O), ifelse(O == 1, "O", "")),
+    ifelse(N > 1, paste0("N", N), ifelse(N == 1, "N", "")),
+    ifelse(S > 1, paste0("S", S), ifelse(S == 1, "S", "")),
+    ifelse(P > 1, paste0("P", P), ifelse(P == 1, "P", ""))
+  )]
+  
+  #remove isotope formulas where no parent is present
+  all_matches <- all_matches[
+    !(C_13 > 0 | O_18 > 0 | S_34 > 0) | 
+      (duplicated(MF) | duplicated(MF, fromLast = TRUE))
+  ]
+  
+  #plot(all_matches$O/all_matches$C, all_matches$H/ all_matches$C)
+  #for the rare case that a merged samplelist contains the same MF with two different masses
+  #will select the one with more hits
+  setorder(all_matches, MF, -present_in)
+  
+  #this appears to be neccessary to make the new column numeric; else if will be logical and the deviance function cannot write into this column
+  all_matches[, isotope_deviance_C_13_1 := 1]
+  all_matches[, isotope_deviance_C_13_2 := 1]
+  all_matches[, isotope_deviance_O_18 := 1]
+  all_matches[, isotope_deviance_S_34 := 1]
+  
+  #calculation of isotope deviances
+  
+  #if multiple samples are present, take the median
+  #this can introduce error.
+  all_matches[, median_intensity := apply(.SD, 1, median, na.rm = TRUE), .SDcols = int_cols]
+  
+  all_matches[, isotope_deviance_C_13_1 := {
+    parent <- median_intensity[C_13 == 0][1] 
+    child <- median_intensity[C_13 == 1][1]# %>% mean()
+    if (length(parent) > 0 & length(child > 0)) {
+      isotope_deviance(
+        parent,
+        child,
+        number_of_atoms = C[1],
+        q = 0.0108,
+        p = 1 - 0.0108,
+        number_of_isotopes = 1
+      )
+    } else {NA}
+  }, by = MF]
+  
+  all_matches[, isotope_deviance_C_13_2 := {
+    parent <- median_intensity[C_13 == 0] [1]
+    child <- median_intensity[C_13 == 2] [1]
+    if (length(parent) > 0 & length(child > 0)) {
+      isotope_deviance(
+        parent,
+        child,
+        number_of_atoms = C[1],
+        q = 0.0108,
+        p = 1 - 0.0108,
+        number_of_isotopes = 2
+      )
+    } else {NA}
+  }, by = MF]
+  
+  all_matches[, isotope_deviance_O_18 := {
+    parent <- median_intensity[O_18 == 0] [1]
+    child <- median_intensity[O_18 == 1] [1]
+    if (length(parent) > 0 & length(child > 0)) {
+      isotope_deviance(
+        parent,
+        child,
+        number_of_atoms = O[1],
+        q = 0.00205,
+        p = 1 - 0.00205,
+        number_of_isotopes = 1
+      )
+    } else {NA}
+  }, by = MF]
+  
+  all_matches[, isotope_deviance_S_34 := {
+    parent <- median_intensity[S_34 == 0][1] 
+    child <- median_intensity[S_34 == 1] [1]
+    if (length(parent) > 0 & length(child > 0)) {
+      isotope_deviance(
+        parent,
+        child,
+        number_of_atoms = S[1],
+        q = 0.0437,
+        p = 1 - 0.0437,
+        number_of_isotopes = 1
+      )
+    } else {NA}
+  }, by = MF]
+  
+  all_matches[, median_intensity := NULL]
+  
+  # Remove rows where C_13 == 2 and isotope_deviance_C_13_1 is NaN, e.g. no C13_1 peak present
+  all_matches <- all_matches[!(C_13 == 2 & is.nan(isotope_deviance_C_13_1))]
+  
+  # Threshold test column
+  all_matches[, isotope_below_threshold := (
+    (isotope_deviance_C_13_1 < threshold ) |
+      (isotope_deviance_C_13_2 < threshold )|
+      (isotope_deviance_O_18 < threshold )|
+      (isotope_deviance_S_34 < threshold ) 
+  )]
+  
+  # Return only best match per measured m/z if requested
+  if (return_likeliest) {
+    #remove isotope formulas below threshold
+    all_matches <- all_matches[!(
+      (isotope_deviance_C_13_1 > threshold & C_13 == 1) |
+        (isotope_deviance_C_13_2 > threshold & C_13 == 2)|
+        (isotope_deviance_O_18 > threshold & O_18 == 1)|
+        (isotope_deviance_S_34 > threshold & S_34 == 1)
+    )]
+    
+    # 2) Homologous series calculation
+    all_matches <- calculate_connections(all_matches, diffs = homologues_network)
+    
+    
+    all_matches[, abs_ppm := abs(ppm)]
+    #sort by isotope verified, number of homologues connections and smallest error
+    setorder(all_matches, m.z, -isotope_below_threshold,
+             -homologues_membership, abs_ppm)
+    #returns only 1 match per unique mz
+    all_matches <- all_matches[, .SD[1], by = m.z]
+    all_matches[, c("abs_ppm", "homologues_membership") := NULL]
+    
+    
+    # Recompute connections
+    all_matches <- calculate_connections(
+      all_matches, diffs = homologues_network
+    )
+    
+  } else{
+    # 2) Homologous series calculation
+    all_matches <- calculate_connections(all_matches, diffs = homologues_network)
+    
+  }
+  
+  #add additional columns with indices
+  all_matches <- all_matches[, `:=`(
+    O.C = O/C, H.C = H/C, N.C = N/C, S.C = S/C, P.C = P/C, 
+    AI_mod =  pmax(0, (1 + C - 0.5 * O - S - 0.5 * (H + N + P)) / (C - 0.5 * O - S - N - P)),
+    NOSC = ((-(4*C + H - 3*N - 2*O + 5*P - 2*S) / C) + 4),
+    DBE    = 1 + (2 * C - H + N + P) / 2
+  )][AI_mod <= 1]
+  
+  all_matches <- all_matches[, `:=`(
+    O.C = round(O.C, 3),
+    H.C = round(H.C, 3),
+    N.C = round(N.C, 3),
+    S.C = round(S.C, 3),
+    P.C = round(P.C, 3), 
+    AI_mod =  round(AI_mod, 3),
+    NOSC = round(NOSC, 3),
+    m.z = round(m.z, 8),
+    m.z_ion = round(m.z_ion, 8)
+  )]
+  
+  # Simple classification
+  all_matches[, class := fifelse(
+    H.C >= 2 , "Saturated",
+    fifelse(
+      H.C >= 1.5 & H.C < 2 , "Unsaturated Aliphatic",
+      fifelse(
+        AI_mod >= 0.67, "Condensed Aromatic",
+        fifelse(
+          AI_mod < 0.67 & AI_mod > 0.5 , "Aromatic",
+          fifelse(
+            AI_mod <= 0.5 & H.C < 1.5,
+            "Highly unsaturated", "Unassigned"
+          )
+        )
+      )
+    )
+    
+  )]
+  
+  
+  # Possibly delete MF without a homologous connection
+  if (delete_MF_without_connection) {
+    all_matches <- all_matches[homologues_membership > 1]
+  }
+  
+  #return and custom order of columns
+  
+  filter_cols <- c(
+    "m.z_ion", "m.z", "calculated_m.z", "absolute_error", "ppm", "MF",
+    "group", "class", "C", "H", "O", "N", "S", "P", "C_13", "O_18", "S_34",
+    "H.C", "O.C", "N.C", "S.C", "P.C", "AI_mod", "NOSC","DBE", "homologues_membership",
+    "isotope_deviance_C_13_1", "isotope_deviance_C_13_2",
+    "isotope_deviance_O_18", "isotope_deviance_S_34", "isotope_below_threshold","present_in","MDL", int_cols
+  )
+  all_matches <- all_matches[, ..filter_cols]
+  setorder(all_matches, m.z)
+  
+  
+  dat <- NULL
+  formulas[, start := NULL]
+  formulas[, end := NULL]
+  
+  
+  gc()
+  return(all_matches)
+}
+
+vk_plot_hist <- function(datasets, trace_names = c(""), title = "", alpha = 0.8, sizes = NULL, colors = NULL, plot_categories =F, plot_hist = T, linewidth = 0.1) {
+  library(viridis)
+  if (is.null(colors)) {
+    colors <- viridis(length(datasets))
+  }
+  # Ensure the sizes vector has the correct length
+  if (is.null(sizes)) {
+    sizes <- rep(3, length(datasets))
+  }
+  
+  # Create main Van Krevelen plot
+  p <- plot_ly(type = "scatter", mode = "markers")
+  
+  if (plot_categories==T){
+    
+    # Define polygons for each class
+    Saturated <- data.frame(
+      O.C = c(0, 1, 1, 0),
+      H.C = c(2, 2, 2.5, 2.5)
+    )
+    
+    unsaturated_aliphatic <- data.frame(
+      O.C = c(0, 1, 1, 0),
+      H.C = c(1.5, 1.5, 2, 2)
+    )
+    
+    
+    condensed_hydrocarbon <- data.frame(
+      O.C = c(0, 0, 1, 1),
+      H.C = c(0.65, 0, 0, 0.5)
+    )
+    
+    aromatic <- data.frame(
+      O.C = c(0, 1, 1, 0),
+      H.C = c(0.65, 0.5, 0.8, 0.95)
+    )
+    
+    highly_unsaturated <- data.frame(
+      O.C = c(0, 1, 1, 0),
+      H.C = c(0.95, 0.8, 1.5, 1.5)
+    )
+    
+    # Create the plot with plotly
+    p <- plot_ly() %>%
+      add_polygons(data = Saturated, x = ~O.C, y = ~H.C, fillcolor = 'rgba(189,189,189, 0.5)', name = "Saturated", line = list(color = "black", width = 0)) %>%
+      add_polygons(data = unsaturated_aliphatic, x = ~O.C, y = ~H.C, fillcolor = 'rgba(159,159,159, 0.5)', name = "Unsaturated aliphatic", line = list(color = "black", width = 0)) %>%
+      add_polygons(data = highly_unsaturated, x = ~O.C, y = ~H.C, fillcolor = 'rgba(105,105,105, 0.5)', name = "Highly unsaturated", line = list(color = "black", width = 0))%>%
+      
+      add_polygons(data = aromatic, x = ~O.C, y = ~H.C, fillcolor = 'rgba(66,66,66, 0.5)', name = "Aromatic", line = list(color = "black", width = 0)) %>%
+      add_polygons(data = condensed_hydrocarbon, x = ~O.C, y = ~H.C, fillcolor = 'rgba(45,45,45, 0.5)', name = "Condensed Hydrocarbon", line = list(color = "black", width = 0))
+    
+  }
+  
+  for (i in seq_along(datasets)) {
+    if(nrow(datasets[[i]]) >0){
+      color <- colors[i]
+      trace_label <- paste0(trace_names[i], " (n = ", nrow(datasets[[i]]), ")")
+      p <- p %>% add_trace(
+        x = datasets[[i]]$O.C,
+        y = datasets[[i]]$H.C,
+        name = trace_label,
+        marker = list(
+          opacity = alpha,
+          color = color,
+          size = sizes[[i]],
+          line = list(color = "black", width = linewidth)
+        )
+      )
+    }
+  }
+  
+  xaxis <- list(
+    title = "O/C",
+    showline = TRUE,
+    linewidth = 1,
+    showgrid = FALSE,
+    tickmode = "array",
+    ticks = "inside",
+    zeroline = FALSE,
+    range = c(-0.025, 1.275),
+    tickvals = c(0, 0.25, 0.5, 0.75, 1,1.25)
+  )
+  
+  yaxis <- list(
+    title = "H/C",
+    showline = TRUE,
+    linewidth = 1,
+    showgrid = FALSE,
+    tickmode = "array",
+    ticks = "inside",
+    zeroline = FALSE,
+    range = c(0, 2.5),
+    tickvals = c(0, 0.5, 1, 1.5, 2, 2.5)
+  )
+  
+  p <- p %>% layout(
+    title = title,
+    xaxis = xaxis, 
+    yaxis = yaxis,
+    legend = list(
+      orientation = "h",
+      x = 0.5,
+      xanchor = "center",
+      y = -0.2
+    )
+  )
+  
+  # Create histograms and density plots
+  
+  if (plot_hist==T){
+    p.O.C.hist.dens <- plot_ly()
+    p.H.C.hist.dens <- plot_ly()
+    max_density_oc <- 0
+    max_density_hc <- 0
+    
+    for (i in seq_along(datasets)) {
+      if(nrow(datasets[[i]]) >0){
+        color <- ifelse(i <= length(colors), colors[i], "black")
+        
+        p.O.C.hist.dens <- p.O.C.hist.dens %>%
+          add_histogram(
+            alpha = 0.5,
+            x = datasets[[i]]$O.C,
+            autobinx = FALSE,
+            xbins = list(start = 0, end = 1.25, size = 0.05),
+            color = I(color),
+            marker = list(line = list(color = "black", width = 0.5)),
+            showlegend = FALSE,
+            histnorm = "percent"
+          )
+        
+        p.O.C.hist.dens <- p.O.C.hist.dens %>%
+          add_lines(
+            x = density(datasets[[i]]$O.C)$x[density(datasets[[i]]$O.C)$x > 0],
+            y = density(datasets[[i]]$O.C)$y[density(datasets[[i]]$O.C)$x > 0],
+            yaxis = "y2",
+            line = list(color = color, width = 2),
+            showlegend = FALSE
+          )
+        
+        max_density_oc <- max(max_density_oc, max(density(datasets[[i]]$O.C)$y))
+        
+        p.H.C.hist.dens <- p.H.C.hist.dens %>%
+          add_trace(
+            alpha = 0.5,
+            type = "histogram",
+            autobiny = FALSE,
+            ybins = list(start = 0, end = 2.5, size = 0.1),
+            y = datasets[[i]]$H.C,
+            color = I(color),
+            marker = list(line = list(color = "black", width = 0.5)),
+            showlegend = FALSE,
+            histnorm = "percent"
+          )
+        
+        p.H.C.hist.dens <- p.H.C.hist.dens %>%
+          add_trace(
+            type = "scatter",
+            mode = "lines",
+            x = density(datasets[[i]]$H.C)$y,
+            y = density(datasets[[i]]$H.C)$x,
+            xaxis = "x2",
+            line = list(color = color, width = 2),
+            showlegend = FALSE
+          )
+        
+        max_density_hc <- max(max_density_hc, max(density(datasets[[i]]$H.C)$y))
+      }
+    }
+    
+    p.O.C.hist.dens <- p.O.C.hist.dens %>% layout(barmode = "overlay")
+    p.O.C.hist.dens <- p.O.C.hist.dens %>%
+      layout(
+        xaxis = list(
+          showline = TRUE,
+          linewidth = 1,
+          showgrid = FALSE,
+          tickmode = "array",
+          ticks = "outside",
+          zeroline = FALSE,
+          range = c(-0.025, 1.275),
+          tickvals = c(0, 0.25, 0.5, 0.75, 1.25),
+          showticklabels = FALSE
+        ),
+        yaxis = list(
+          showline = FALSE,
+          showgrid = FALSE,
+          showticklabels = FALSE
+        ),
+        yaxis2 = list(
+          overlaying = "y",
+          side = "right",
+          range = c(0, max_density_oc * 1.05),
+          showline = FALSE,
+          showgrid = FALSE,
+          showticklabels = FALSE
+        )
+      )
+    
+    p.H.C.hist.dens <- p.H.C.hist.dens %>% layout(barmode = "overlay")
+    p.H.C.hist.dens <- p.H.C.hist.dens %>%
+      layout(
+        yaxis = list(
+          showline = TRUE,
+          linewidth = 1,
+          showgrid = FALSE,
+          tickmode = "array",
+          ticks = "outside",
+          zeroline = FALSE,
+          range = c(0, 2.5),
+          tickvals = c(0, 0.5, 1, 1.5, 2, 2.5),
+          showticklabels = FALSE
+        ),
+        xaxis = list(
+          showline = FALSE,
+          showgrid = FALSE,
+          showticklabels = FALSE
+        ),
+        xaxis2 = list(
+          overlaying = "x4",
+          side = "top",
+          range = c(0, max_density_hc * 1.05),
+          showgrid = FALSE,
+          showline = FALSE,
+          showticklabels = FALSE
+        )
+      )
+    # Finalize the plot
+    p_final <-subplot(
+      p.O.C.hist.dens, plotly_empty(),
+      p, p.H.C.hist.dens,
+      shareX = FALSE, shareY = FALSE, nrows = 2,
+      widths = c(0.8, 0.2),
+      heights = c(0.2, 0.8),
+      margin = 0,
+      titleX = TRUE,
+      titleY = TRUE
+    )
+    return(p_final)
+  }
+  if (plot_hist == F){
+    # Finalize the plot
+    p
+  }
+  
+}
+
+
+###############################################################################
+#               Panel 1:  Functions & Shiny UI/Server Code                    #
+#                    (Instrument Blanks Noise Removal)                    #
+###############################################################################
+
+# -- Panel 1 Functions --
+# Set maximum file size (adjust as needed)
+options(shiny.maxRequestSize = 4096 * 4096 * 4096)
+
+
 
 # -- Panel 1 UI --
 # -- Panel 1 UI --
@@ -302,144 +1273,7 @@ panel1_server <- function(input, output, session) {
 #                      (Molecular Formula Generator)                          #
 ###############################################################################
 
-isotope_combinations <- function(formulas_dt, mass_range,
-                                 mass_C, mass_H, mass_O, mass_N, mass_S, mass_P) {
-  # Construct a grid for all possible isotopes (within the defined maxima).
-  isotope_grid <- CJ(
-    O_18 = 0:max(formulas_dt$max_O18),
-    C_13 = 0:max(formulas_dt$max_C13),
-    S_34 = 0:max(formulas_dt$max_S34)
-  )
-  
-  # Only keep relevant combinations:
-  #  - Single extra isotope (O_18, S_34, or C_13)
-  #    OR a double 13C (C_13 == 2) with no O_18 / S_34
-  isotope_grid <- isotope_grid[
-    (O_18 + S_34 + C_13 == 1) | (C_13 == 2 & O_18 == 0 & S_34 == 0)
-  ]
-  
-  # Expand the formula set
-  expanded_formulas <- formulas_dt[rep(seq_len(.N), each = nrow(isotope_grid))]
-  expanded_isotopes <- isotope_grid[rep(seq_len(nrow(isotope_grid)), times = formulas_dt[ , .N])]
-  combined_formulas <- cbind(expanded_formulas, expanded_isotopes)
-  
-  # Only valid if isotopes actually exist in the formula
-  combined_formulas <- combined_formulas[
-    (C_13 > 0 & O_18 == 0 & S_34 == 0) |
-      ((S_34 > 0 & S > 0) | (O_18 > 0 & O > 0))
-  ]
-  
-  # Recompute m/z for these isotopes
-  combined_formulas[ ,
-                     mz := C * mass_C + H * mass_H + O * mass_O + N * mass_N + S * mass_S + P * mass_P +
-                       C_13 * (13.00335540 - mass_C) +
-                       O_18 * (17.99915960 - mass_O) +
-                       S_34 * (33.96786690 - mass_S)
-  ]
-  
-  # Keep only those within the requested m/z range
-  combined_formulas[mz >= mass_range[1] & mz <= mass_range[2]]
-}
 
-
-generate_formulas <- function(C_range = 1:50, H_range = 2:120, O_range = 0:50,
-                              N_range = 0:4, S_range = 0:2, P_range = 0:1,
-                              mass_range = c(50, 1000), HC = c( 0.2, 3), OC = c(0, 1.2), insert_isotopes = T) {
-  
-  # Define element masses in one place
-  mass_C  <- 12
-  mass_H  <- 1.00782503
-  mass_O  <- 15.99491463
-  mass_N  <- 14.00307400
-  mass_S  <- 31.97207117
-  mass_P  <- 30.97376203
-  
-  # Create the grid of C, N, S, P and apply basic filters
-  dt <- CJ(C = C_range, N = N_range, S = S_range, P = P_range)[
-    C > 0 &
-      (N / C) <= 1.3 & (S / C) <= 0.8 & (P / C) <= 0.3 &
-      !(N > 1 & (S + P > 0)) &
-      !(N != 0 & S != 0 & P != 0) &
-      !(S + P > 2) &
-      !(N == 1 & (S > 1 | P > 1))
-  ]
-  
-  # Precompute min and max for H and O based on rules
-  dt[ , `:=`(
-    H_min = pmax(ceiling(HC[1] * C), H_range[1]),
-    H_max = pmin(floor(HC[2] * C), max(H_range)),
-    O_max = pmin(floor(OC[2] * C), max(O_range))
-  )]
-  
-  # Construct possible (H, O) combinations
-  results <- dt[ , {
-    if (H_min <= H_max) {
-      H_values <- H_min:H_max
-      O_values <- seq.int(0, O_max)
-      H_O_dt <- CJ(H = H_values, O = O_values)[
-        (H / C) >= HC[1] & (H / C) <= HC[2] & (O / C) >= OC[1] & (O / C) <= OC[2]
-      ]
-    } else {
-      H_O_dt <- NULL
-    }
-    H_O_dt
-  }, by = .(C, N, S, P)]
-  
-  # Compute DBE and valence, then subset
-  results[ , `:=`(
-    DBE    = 1 + (2 * C - H + N + P) / 2,
-    valence = C * 4 + H * 1 + O * 2 + N * 3 + S * 2 + P * 5
-  )]
-  results <- results[
-    DBE >= 0 & DBE %% 1 == 0 &
-      valence %% 2 == 0
-  ][ , c("DBE", "valence") := NULL]  # drop columns right after filtering
-  
-  # Compute final m/z
-  results[ ,
-           mz := C * mass_C + H * mass_H + O * mass_O + N * mass_N + S * mass_S + P * mass_P
-  ]
-  results <- results[mz >= mass_range[1] & mz <= mass_range[2]]
-  
-  # Insert isotopes if needed
-  if (isTRUE(insert_isotopes)) {
-    results[ , `:=`(
-      max_O18 = pmin(1, O),
-      max_C13 = pmin(2, C),
-      max_S34 = pmin(1, S)
-    )]
-    
-    # Reuse the pre-defined function
-    results_isotopes <- isotope_combinations(
-      formulas_dt = results,
-      mass_range  = mass_range,
-      mass_C      = mass_C,
-      mass_H      = mass_H,
-      mass_O      = mass_O,
-      mass_N      = mass_N,
-      mass_S      = mass_S,
-      mass_P      = mass_P
-    )
-    results <- rbind(results, results_isotopes, use.names = TRUE, fill = TRUE)
-    
-  } else {
-    # If not inserting isotopes, fill with zeros
-    results[ , c("O_18", "C_13", "S_34") := 0]
-  }
-  
-  # Final columns, replace NAs, and sort
-  results <- results[ , .(
-    C, H, O, N, S, P,
-    C_13      = ifelse(is.na(C_13), 0, C_13),
-    O_18      = ifelse(is.na(O_18), 0, O_18),
-    S_34      = ifelse(is.na(S_34), 0, S_34),
-    calculated_m.z = round(mz,8)
-  )]
-  
-  setorder(results, calculated_m.z)
-  gc()
-  return(results)
-}
 
 
 # -- Panel 2 UI --
@@ -521,132 +1355,7 @@ panel2_server <- function(input, output, session) {
 
 #still performs poorly in areas outside of calibration.
 
-# -- Panel 3 Functions --
 
-mz_recalibration <- function(
-    formulas,
-    spectrum,
-    ppm_tolerance   = 0.5,
-    ion             = 1.007825032 + -1 * 0.00054857990907,
-    S_MDL_limit     = 2,
-    hom_member_min  = 2,
-    showplot = F,
-    samplename= ""
-) {
-  SSE_1 <- 0
-  SSE_2 <- 0
-  plot <- plot_ly(type = "scatter", mode = "text",
-                  x = 1, y = 1, text = "Not enough points")%>%
-    layout(title = samplename, xaxis = list(title = "m/z"),
-           yaxis = list(title = "ppm"))
-  
-
-  
-  data <- copy(spectrum)
-  
-  data_original <- copy (data)
-  
-  tryCatch({
-
-    # 2) Filter data by I / MDL > S_MDL_limit 
-    data <- data[I / MDL > S_MDL_limit]
-    
-    # 3) Assign formulas 
-    out <- formula_assignment_multi_intensity(
-      formulas,
-      data,
-      ppm_tolerance = ppm_tolerance,
-      ion           = ion,
-      threshold = 200,
-      delete_singlets = F,
-      delete_MF_without_connection = F
-    )[homologues_membership >= hom_member_min]
-
-
-    # 5) If the filtered data is still sufficiently large, proceed with outlier filtering + GAM model
-    if (nrow(out) > 20) {
-      
-      # -- Quantile-based filtering in data.table style
-      #could also filter along the mz axis?
-      Q1   <- quantile(out$ppm, 0.25)
-      Q3   <- quantile(out$ppm, 0.75)
-      IQRv <- Q3 - Q1
-      out  <- out[ppm > (Q1 - 1.5 * IQRv) & ppm < (Q3 + 1.5 * IQRv)]
-      
-      SSE_1 <- round(sum(out$ppm^2),2)
-      
-      # -- Fit a GAM model
-      gam_model <- gam(ppm ~ s(m.z, bs = "cs", k = 4), data = out)
-      #plot(gam_model)
-
-      data_original[, predicted_drift_ppm :=
-                      predict(gam_model, newdata = .SD),
-                    .SDcols = "m.z"]
-      data_original[, m.z :=
-                      m.z * (1 + predicted_drift_ppm / 1e6)]
-
-      
-    } else {
-    }
-    
-
-    if(showplot & nrow(out) > 20){
-      plot1 <- plot_ly() %>%
-        
-        add_trace(data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
-                  marker = list(color = 'grey', size = 5), name = paste0("SSE before: ",SSE_1)) %>%
-        add_trace(data = data_original, x = ~m.z, y = ~predicted_drift_ppm, type = 'scatter', mode = 'lines',
-                  line = list(color = 'red', width = 2), name = 'GAM Model') %>%
-        layout(title = samplename, xaxis = list(title = "m/z", range=c(min(out$m.z),max(out$m.z))),
-               yaxis = list(title = "ppm", range=c(-ppm_tolerance,ppm_tolerance)))
-      
-      #repeat assignment
-      data <- data_original[I / MDL > S_MDL_limit]
-      
-      # 3) Assign formulas and filter by atomic composition
-      out <- formula_assignment_multi_intensity(
-        formulas,
-        data,
-        ppm_tolerance = ppm_tolerance,
-        ion           = ion,
-        threshold = 200,
-        delete_singlets = F,
-        delete_MF_without_connection = F
-      )[homologues_membership >= hom_member_min]
-
-
-    
-      
-      # -- Quantile-based filtering in data.table style
-      Q1   <- quantile(out$ppm, 0.25)
-      Q3   <- quantile(out$ppm, 0.75)
-      IQRv <- Q3 - Q1
-      out  <- out[ppm > (Q1 - 1.5 * IQRv) & ppm < (Q3 + 1.5 * IQRv)]
-      SSE_2 <- round(sum(out$ppm^2),2)
-      
-      plot2 <- plot_ly() %>%
-        
-        add_trace(data = out, x = ~m.z, y = ~ppm, type = 'scatter', mode = 'markers',
-                  marker = list(color = 'black', size = 5), name = paste0("SSE after: ",SSE_2)) %>%
-        
-        layout(title = samplename, xaxis = list(title = "m/z", range=c(min(out$m.z),max(out$m.z))), yaxis = list(title = "ppm"))
-      
-      
-      plot <- subplot(plot1, plot2, shareY = T, titleX = T, titleY = T)
-      
-      
-    }
-    gc()
-    
-    }, error = function(e) {
-    print(paste0("Error in Sample: ",samplename, ". Original data returned"))
-  })
-
-  return(list(data =data_original[, .(m.z, I, MDL)],
-              plot = plot,
-              SSE_1 = SSE_1,
-              SSE_2 = SSE_2))
-}
 
 # -- Panel 3 UI --
 panel3_ui <- fluidPage(
@@ -784,60 +1493,7 @@ panel3_server <- function(input, output, session) {
 #                      (Merge m/z Values)                                     #
 ###############################################################################
 
-# -- Panel 4 Functions --
-merge_mz_values <- function(dt, ppm_tolerance) {
-  
-  
-  # # Rename columns 
-  # setnames(dt, old = colnames(dt)[1], new = "mz")
-  # setnames(dt, old = colnames(dt)[3], new = "MDL")
-  
-  # Sort by m/z
-  
-  setorder(dt, m.z)
-  
-  # Compute difference in ppm between consecutive m/z
-  dt[, diff_ppm := (m.z - shift(m.z, type = "lag")) / shift(m.z, type = "lag") * 1e6]
-  # Replace the first NA with Inf (equivalent to c(Inf, diff(m.z))/m.z * 1e6)
-  dt[is.na(diff_ppm), diff_ppm := Inf]
-  
-  # Identify groups whose differences exceed ppm_tolerance
-  dt[, group := cumsum(diff_ppm > ppm_tolerance)]
-  
-  # Calculate the weighted mean m/z and other values 
-  merged <- dt[, {
-    sqrt_I <- sqrt(I)
-    sum_sqrt_I <- sum(sqrt_I)
-    .(
-      merged_m.z = sum(m.z * sqrt_I) / sum_sqrt_I,
-      mean_MDL  = MDL[1],            #MDL should be the same accross all samples.                   
-      SE        = round(sd(m.z) / (sum(m.z * sqrt_I) / sum_sqrt_I) * 1e6,5)
-    )
-  }, by = group]
-  
-  # Update-join  to add columns back
-  dt[merged, on = "group", `:=`(
-    merged_m.z = i.merged_m.z,
-    mean_MDL  = i.mean_MDL,
-    SE        = i.SE
-  )]
-  
-  # Remove duplicates by selecting the first row per group and index
-  dt2 <- dt[, .SD[1], keyby = .(group, index)]
-  
-  # Reshape to wide format; each index becomes a column
-  dt_wide <- dcast(
-    dt2,
-    merged_m.z + mean_MDL + SE ~ index,
-    value.var = "I",
-    fill = NA
-  )
-  
-  # Rename columns for the final output
-  setnames(dt_wide, old = c("merged_m.z", "mean_MDL"), new = c("m.z", "MDL"))
-  gc()
-  return(dt_wide)
-}
+
 
 
 # -- Panel 4 UI --
@@ -903,371 +1559,7 @@ panel4_server <- function(input, output, session) {
 #              (Formula Assignment and Isotope Calculation)                   #
 ###############################################################################
 
-# -- Panel 5 Functions --
-# Compute isotope deviance
-isotope_deviance <- function(intensity_parent, intensity_child,
-                             number_of_atoms, q, p, number_of_isotopes = 1) {
-  expected_intensity_ratio <- dbinom(number_of_isotopes, number_of_atoms, q) /
-    dbinom(number_of_atoms, number_of_atoms, p)
-  ratio <- intensity_child / intensity_parent
-  
-  # Weighted mean of ratio, then scaled relative to expected_intensity_ratio
-  rdeviance <- ((ratio / expected_intensity_ratio) - 1) * 1000
-  return(round(rdeviance))
-}
 
-
-
-# Identify group connections for a single group
-calculate_group_connections <- function(dt_group, diffs) {
-  
-  group_results <- lapply(names(diffs), function(diff_name){
-    diff_vector <- diffs[[diff_name]]
-    diff_dt <- dt_group[, .(
-      C = C + diff_vector["C"],
-      H = H + diff_vector["H"],
-      O = O + diff_vector["O"],
-      N = N + diff_vector["N"],
-      S = S + diff_vector["S"],
-      P = P + diff_vector["P"],
-      from_index = index
-    )]
-    
-    # Match the diff_dt to dt_group by the new formula
-    setkeyv(diff_dt, c("C", "H", "O", "N", "S", "P"))
-    setkeyv(dt_group, c("C", "H", "O", "N", "S", "P"))
-    
-    #the following can throw an error if allow.cartesian is not set to true.
-    #need to investigate the reason.
-    matched <- dt_group[diff_dt, nomatch = 0L, allow.cartesian = TRUE]
-    
-    if (nrow(matched) > 0) {
-      matched[, .(
-        from_index = from_index,
-        to_index = index,
-        connection_type = diff_name
-      )]
-      
-      
-    }
-  })
-  names(group_results) <- names(diffs)
-  
-  
-  # Combine all connections for this group
-  all_group_connections <- rbindlist(group_results, use.names = TRUE, fill = TRUE)
-  
-  # Tag any formula with no connections
-  no_connections <- dt_group[
-    !index %in% unique(c(all_group_connections$from_index, all_group_connections$to_index)),
-    .(from_index = index, to_index = NA, connection_type = "No Connection")
-  ]
-  all_group_connections <- rbind(all_group_connections, no_connections, fill = TRUE)
-  
-  return(all_group_connections)
-}
-
-# --- Main Functions ---
-
-
-
-# Calculate homologous connections 
-calculate_connections <- function(dt, diffs = list(
-  CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
-  H   = c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
-)) {
-  
-  
-  # Group assignment
-  dt[, group := fifelse(N > 0 & P > 0, "NP",
-                        fifelse(N > 0 & (S > 0 | S_34 > 0), "NS",
-                                fifelse((S > 0 | S_34 > 0) & P > 0, "SP",
-                                        fifelse(N > 0 & S == 0 & P == 0 & S_34 == 0, "N",
-                                                fifelse((S > 0 | S_34 > 0) & N == 0 & P == 0, "S",
-                                                        fifelse(P > 0 & S == 0 & N == 0 & S_34 == 0, "P",
-                                                                fifelse(O > 0 & P == 0 & S == 0 & N == 0 & S_34 == 0, "CHO",
-                                                                        fifelse(O == 0 & P == 0 & S == 0 & N == 0 & S_34 == 0, "CH", "None"))))))))]
-  
-  # Calculate connections in each group
-  
-  setorder(dt, C, H, O)
-  dt[, index := .I]
-  
-  
-  all_connections <- lapply(unique(dt$group), function(grp){
-    dt_group <- dt[group == grp]
-    calculate_group_connections(dt_group, diffs)
-  }) %>% rbindlist(use.names = T, fill = T)
-  
-  
-  # Graph-based approach to membership
-  Ak <- igraph::graph_from_data_frame(all_connections[!is.na(to_index)], directed = FALSE) %>%
-    igraph::components()
-  membership_dt <- data.table(index = as.integer(names(Ak$membership)),
-                              homologues_membership = Ak$membership)
-  #sum up network members
-  membership_dt[, homologues_membership := .N, by = homologues_membership]
-  
-  out <- merge(dt, membership_dt, by = "index", all.x = TRUE)
-  out[is.na(homologues_membership), homologues_membership := 1]
-  
-  return(out)
-}
-
-# Main formula assignment that calls the above functions
-formula_assignment_multi_intensity <- function(
-    formulas, dataset, ppm_tolerance = 0.5,
-    ion = 1.007825032 + -1 * 0.00054857990907,
-    threshold = 1000, return_likeliest = TRUE,
-    delete_singlets = FALSE, delete_MF_without_connection = TRUE,
-    homologues_network = list(
-      CH2 = c(C = 1, H = 2, O = 0, N = 0, S = 0, P = 0),
-      H   = c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
-    )
-) {
-  
-  dat <- copy(dataset) #create a clean copy to remove referencing to old dataset
-  
-  # Get the column names of of the samples
-  exclude_cols <- c("m.z", "MDL", "m.z_ion", "C", "H", "O", "N", "S", "P",
-                    "C_13", "O_18", "S_34", "calculated_m.z", "absolute_error", "ppm", "MF",
-                    "SE","predicted_drift_ppm", "present_in")
-  
-  int_cols <- setdiff(colnames(dat), exclude_cols)
-  
-  dat[, present_in := rowSums(!is.na(.SD)), .SDcols = int_cols]
-  
-  
-  # Delete singlets if chosen
-  if (delete_singlets) {
-    dat <- dat[present_in > 1]
-  }
-  
-  # Adjust m.z by the chosen ion mass
-  dat[, m.z_ion := m.z]
-  dat[, m.z := m.z + ion]
-  
-  # Generate tolerance columns
-  dat[, `:=`(lower_limit = m.z * (1 - ppm_tolerance / 1e6),
-             upper_limit = m.z * (1 + ppm_tolerance / 1e6))]
-  
-  # Prepare formula data and set keys for overlap
-  formulas[, `:=`(start = calculated_m.z, end = calculated_m.z)]
-  setkey(formulas, start, end)
-  setkey(dat, lower_limit, upper_limit)
-  
-  all_matches <- data.table()
-  # Overlap join
-  all_matches <- foverlaps(
-    formulas, dat, 
-    by.x = c("start", "end"),
-    by.y = c("lower_limit", "upper_limit"),
-    type = "within", nomatch = 0
-  )
-  dat[, c("lower_limit", "upper_limit") := NULL]
-  #calculate the errors
-  
-  all_matches[, absolute_error := calculated_m.z - m.z]
-  all_matches[, ppm := round(((absolute_error / m.z) * 1e6),3)]
-  all_matches[, absolute_error := round(absolute_error,6)]
-  
-  all_matches[, c("lower_limit", "upper_limit", "start", "end") := NULL]
-  
-  #construct the formula
-  
-  all_matches[, MF := paste0(
-    ifelse(C > 1, paste0("C", C), ifelse(C == 1, "C", "")),
-    ifelse(H > 1, paste0("H", H), ifelse(H == 1, "H", "")),
-    ifelse(O > 1, paste0("O", O), ifelse(O == 1, "O", "")),
-    ifelse(N > 1, paste0("N", N), ifelse(N == 1, "N", "")),
-    ifelse(S > 1, paste0("S", S), ifelse(S == 1, "S", "")),
-    ifelse(P > 1, paste0("P", P), ifelse(P == 1, "P", ""))
-  )]
-  
-  #remove isotope formulas where no parent is present
-  all_matches <- all_matches[
-    !(C_13 > 0 | O_18 > 0 | S_34 > 0) | 
-      (duplicated(MF) | duplicated(MF, fromLast = TRUE))
-  ]
-  
-  
-  #for the rare case that a merged samplelist contains the same MF with two different masses
-  #will select the one with more hits
-  setorder(all_matches, MF, -present_in)
-  
-  #this appears to be neccessary to make the new column numeric; else if will be logical and the deviance function cannot write into this column
-  all_matches[, isotope_deviance_C_13_1 := 1]
-  all_matches[, isotope_deviance_C_13_2 := 1]
-  all_matches[, isotope_deviance_O_18 := 1]
-  all_matches[, isotope_deviance_S_34 := 1]
-  
-  #calculation of isotope deviances
-  
-#if multiple samples are present, take the median
-  #this can introduce error.
-  all_matches[, median_intensity := apply(.SD, 1, median, na.rm = TRUE), .SDcols = int_cols]
-  
-  all_matches[, isotope_deviance_C_13_1 := {
-    parent <- median_intensity[C_13 == 0][1] 
-    child <- median_intensity[C_13 == 1][1]# %>% mean()
-    if (length(parent) > 0 & length(child > 0)) {
-      isotope_deviance(
-        parent,
-        child,
-        number_of_atoms = C[1],
-        q = 0.0108,
-        p = 1 - 0.0108,
-        number_of_isotopes = 1
-      )
-    } else {NA}
-  }, by = MF]
-  
-  all_matches[, isotope_deviance_C_13_2 := {
-    parent <- median_intensity[C_13 == 0] [1]
-    child <- median_intensity[C_13 == 2] [1]
-    if (length(parent) > 0 & length(child > 0)) {
-      isotope_deviance(
-        parent,
-        child,
-        number_of_atoms = C[1],
-        q = 0.0108,
-        p = 1 - 0.0108,
-        number_of_isotopes = 2
-      )
-    } else {NA}
-  }, by = MF]
-  
-  all_matches[, isotope_deviance_O_18 := {
-    parent <- median_intensity[O_18 == 0] [1]
-    child <- median_intensity[O_18 == 1] [1]
-    if (length(parent) > 0 & length(child > 0)) {
-      isotope_deviance(
-        parent,
-        child,
-        number_of_atoms = O[1],
-        q = 0.00205,
-        p = 1 - 0.00205,
-        number_of_isotopes = 1
-      )
-    } else {NA}
-  }, by = MF]
-  
-  all_matches[, isotope_deviance_S_34 := {
-    parent <- median_intensity[S_34 == 0][1] 
-    child <- median_intensity[S_34 == 1] [1]
-    if (length(parent) > 0 & length(child > 0)) {
-      isotope_deviance(
-        parent,
-        child,
-        number_of_atoms = S[1],
-        q = 0.0437,
-        p = 1 - 0.0437,
-        number_of_isotopes = 1
-      )
-    } else {NA}
-  }, by = MF]
-  
-  all_matches[, median_intensity := NULL]
-  
-  # Remove rows where C_13 == 2 and isotope_deviance_C_13_1 is NaN, e.g. no C13_1 peak present
-  all_matches <- all_matches[!(C_13 == 2 & is.nan(isotope_deviance_C_13_1))]
-  
-  # Threshold test column
-  all_matches[, isotope_below_threshold := (
-    (isotope_deviance_C_13_1 < threshold ) |
-      (isotope_deviance_C_13_2 < threshold )|
-      (isotope_deviance_O_18 < threshold )|
-      (isotope_deviance_S_34 < threshold ) 
-  )]
-  
-  # Return only best match per measured m/z if requested
-  if (return_likeliest) {
-    #remove isotope formulas below threshold
-    all_matches <- all_matches[!(
-      (isotope_deviance_C_13_1 > threshold & C_13 == 1) |
-        (isotope_deviance_C_13_2 > threshold & C_13 == 2)|
-        (isotope_deviance_O_18 > threshold & O_18 == 1)|
-        (isotope_deviance_S_34 > threshold & S_34 == 1)
-    )]
-    
-    # 2) Homologous series calculation
-    all_matches <- calculate_connections(all_matches, diffs = homologues_network)
-    
-    
-    all_matches[, abs_ppm := abs(ppm)]
-    #sort by isotope verified, number of homologues connections and smallest error
-    setorder(all_matches, m.z, -isotope_below_threshold,
-             -homologues_membership, abs_ppm)
-    #returns only 1 match per unique mz
-    all_matches <- all_matches[, .SD[1], by = m.z]
-    all_matches[, c("abs_ppm", "homologues_membership") := NULL]
-    
-    
-    # Recompute connections
-    all_matches <- calculate_connections(
-      all_matches, diffs = homologues_network
-    )
-    
-  } else{
-    # 2) Homologous series calculation
-    all_matches <- calculate_connections(all_matches, diffs = homologues_network)
-    
-  }
-  
-  #add additional columns with indices
-  all_matches <- all_matches[, `:=`(
-    O.C = round(O/C,2), H.C = round(H/C,2), N.C = round(N/C,2), S.C = round(S/C,2), P.C = round(P/C,2), 
-    AI_mod =  round(pmax(0, (1 + C - 0.5 * O - S - 0.5 * (H + N + P)) / (C - 0.5 * O - S - N - P)),2),
-    NOSC = round(((-(4*C + H - 3*N - 2*O + 5*P - 2*S) / C) + 4),2),
-    DBE    = 1 + (2 * C - H + N + P) / 2
-  )][AI_mod <= 1]
-  
-  # Simple classification
-  all_matches[, class := fifelse(
-    H.C >= 2 , "Saturated",
-    fifelse(
-      H.C >= 1.5 & H.C < 2 , "Unsaturated Aliphatic",
-      fifelse(
-        AI_mod >= 0.67, "Condensed Aromatic",
-        fifelse(
-          AI_mod < 0.67 & AI_mod > 0.5 , "Aromatic",
-          fifelse(
-            AI_mod <= 0.5 & H.C < 1.5,
-            "Highly unsaturated", "Unassigned"
-          )
-        )
-      )
-    )
-    
-  )]
-  
-  
-  # Possibly delete MF without a homologous connection
-  if (delete_MF_without_connection) {
-    all_matches <- all_matches[homologues_membership > 1]
-  }
-  
-  #return and custom order of columns
-  
-  filter_cols <- c(
-    "m.z_ion", "m.z", "calculated_m.z", "absolute_error", "ppm", "MF",
-    "group", "class", "C", "H", "O", "N", "S", "P", "C_13", "O_18", "S_34",
-    "H.C", "O.C", "N.C", "S.C", "P.C", "AI_mod", "NOSC","DBE", "homologues_membership",
-    "isotope_deviance_C_13_1", "isotope_deviance_C_13_2",
-    "isotope_deviance_O_18", "isotope_deviance_S_34", "isotope_below_threshold","present_in","MDL", int_cols
-  )
-  all_matches <- all_matches[, ..filter_cols]
-  setorder(all_matches, m.z)
-  
-  
-  dat <- NULL
-  formulas[, start := NULL]
-  formulas[, end := NULL]
-  
-  
-  gc()
-  return(all_matches)
-}
 
 
 # -- Panel 5 UI --
@@ -1287,7 +1579,7 @@ panel5_ui <- fluidPage(
                            "C2HO" = "C2HO",
                            "CO2"  = "CO2",
                            "H2O"  = "H2O",
-                           "H"    = "H",
+                           "H2"    = "H2",
                            "O"    = "O",
                            "NH3"  = "NH3"
                          ),
@@ -1297,6 +1589,7 @@ panel5_ui <- fluidPage(
       textOutput("status_panel5")
     ),
     mainPanel(
+      plotlyOutput("VK_plot"),
       DTOutput("results_table_panel_5")
     )
   )
@@ -1330,7 +1623,7 @@ panel5_server <- function(input, output, session) {
       if ("C2HO" %in% input$homologues_network_panel5) selected_homologues$C2HO <- c(C = 2, H = 1, O = 1, N = 0, S = 0, P = 0)
       if ("CO2"  %in% input$homologues_network_panel5) selected_homologues$CO2  <- c(C = 1, H = 0, O = 2, N = 0, S = 0, P = 0)
       if ("H2O"  %in% input$homologues_network_panel5) selected_homologues$H2O  <- c(C = 0, H = 2, O = 1, N = 0, S = 0, P = 0)
-      if ("H"    %in% input$homologues_network_panel5) selected_homologues$H    <- c(C = 0, H = 1, O = 0, N = 0, S = 0, P = 0)
+      if ("H2"    %in% input$homologues_network_panel5) selected_homologues$H2    <- c(C = 0, H = 2, O = 0, N = 0, S = 0, P = 0)
       if ("O"    %in% input$homologues_network_panel5) selected_homologues$O    <- c(C = 0, H = 0, O = 1, N = 0, S = 0, P = 0)
       if ("NH3"  %in% input$homologues_network_panel5) selected_homologues$NH3  <- c(C = 0, H = 3, O = 0, N = 1, S = 0, P = 0)
       
@@ -1369,6 +1662,11 @@ panel5_server <- function(input, output, session) {
   
   output$results_table_panel_5 <- renderDT({
     crosstab()
+  })
+  
+  output$VK_plot <- renderPlotly({
+    req(crosstab())
+    vk_plot_hist(list(crosstab()))
   })
   
   
